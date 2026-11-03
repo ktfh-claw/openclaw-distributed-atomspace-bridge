@@ -211,16 +211,16 @@ def test_ledger_repo_dir_missing_exits_1():
 
 
 def test_trace_unparseable_exits_1():
-    # A parenthesized segment whose CONTENT fails parse_fact — the preserved
-    # harness-error shape (with prose-skip, non-parenthesized segments are
-    # prose: skipped, recorded in prose_segments, never an error).
+    # A parenthesized segment whose CONTENT fails parse_fact — with the
+    # openclaw-sut-adapter fix (2026-11-03), unparseable steps are SKIPPED
+    # (classified "unparseable"), not harness errors: agent transcription
+    # errors (missing quotes/parens) must not abort the reconstruction.
     with tempfile.TemporaryDirectory() as root:
         repo, _ = _make_ledger_repo(root, [_ledger_entry()])
         bad = '((A) (B))'
         rc, _, err = _run_cli(["--trace", bad, "--ledger-repo", repo])
-        assert rc == 1
-        assert "trace unparseable" in err
-        assert "'((A) (B))'" in err  # names the offending segment
+        assert rc == 0
+        assert "trace unparseable" not in err
 
 
 def test_mongo_seam_raising_exits_1():
@@ -896,15 +896,15 @@ def test_live_prose_shape_skipped():
 
 def test_strip_stv_malformed_falls_through():
     # Malformed stv annotations fall through to normal parsing, which
-    # raises MettaParseError — the existing HarnessError path is preserved.
-    # `((A) (stv 1.0))` is a wrapped shape with a MALFORMED stv (only one
-    # number) → falls through → parse_fact raises.
+    # raises MettaParseError — with the openclaw-sut-adapter fix
+    # (2026-11-03), unparseable steps are SKIPPED (classified
+    # "unparseable"), not harness errors.
     with tempfile.TemporaryDirectory() as root:
         repo, _ = _make_ledger_repo(root, [_ledger_entry()])
         rc, _, err = _run_cli(
             ["--trace", '((A) (stv 1.0))', "--ledger-repo", repo])
-        assert rc == 1
-        assert "trace unparseable" in err
+        assert rc == 0
+        assert "trace unparseable" not in err
 
 
 def test_segment_loop_strip_before_paren_check():

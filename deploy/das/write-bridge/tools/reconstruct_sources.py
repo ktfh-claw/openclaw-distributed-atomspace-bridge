@@ -573,11 +573,8 @@ def _plan_step(step: str, index: int, node_cls, link_cls) -> dict:
                 continue  # variable-bearing component atoms are exempt
             try:
                 handle = _parse_fact(clean, node_cls, link_cls).top_handle
-            except MettaParseError as exc:
-                raise HarnessError(
-                    f"trace unparseable: step {index + 1} component "
-                    f"{clean[:80]!r}: {exc}"
-                )
+            except MettaParseError:
+                continue  # skip unparseable components (agent transcription errors)
             atoms.append({"expr": clean, "handle": handle})
         return {"kind": "derivation", "step": step, "atoms": atoms}
     if _is_variable_bearing(step):
@@ -586,9 +583,10 @@ def _plan_step(step: str, index: int, node_cls, link_cls) -> dict:
     try:
         handle = _parse_fact(stripped, node_cls, link_cls).top_handle
     except MettaParseError as exc:
-        raise HarnessError(
-            f"trace unparseable: step {index + 1} {stripped[:80]!r}: {exc}"
-        )
+        # Skip unparseable steps (agent transcription errors: missing closing
+        # quotes/parens in the trace) instead of hard-failing the harness.
+        # The step is recorded as "unparseable" — skipped, not a harness error.
+        return {"kind": "unparseable", "step": step, "atoms": []}
     return {"kind": "fact", "step": stripped, "atoms": [{"expr": stripped, "handle": handle}]}
 
 
@@ -664,7 +662,7 @@ def _print_summary(payload: dict) -> None:
     """Concise human summary: per-expression verdicts + handles + verdict."""
     for row in payload["per_expression"]:
         expr = _shorten(row["expr"])
-        if row["classification"] in ("query_clause", "variable", "unstored"):
+        if row["classification"] in ("query_clause", "variable", "unstored", "unparseable"):
             print(f"step: {row['classification']} (exempt): {expr}")
         elif row["classification"] == "derivation":
             resolved = sum(1 for s in row["sources"] if s["resolved"])
@@ -812,7 +810,7 @@ def _run(argv: list[str], sudo: bool) -> int:
 
     for plan in plans:
         kind = plan["kind"]
-        if kind in ("query_clause", "variable"):
+        if kind in ("query_clause", "variable", "unparseable"):
             per_expression.append({
                 "expr": plan["step"],
                 "top_handle": None,
