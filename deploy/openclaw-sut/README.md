@@ -16,7 +16,7 @@ Spec: `specs/openclaw-sut-adapter/spec.md` (R-D1..R-D8).
 | Piece                     | What                                                        |
 | ------------------------- | ----------------------------------------------------------- |
 | `openclaw-sut-gateway`    | gateway container from `openclaw-sut:2026.10.10-metta1`     |
-| wrapper image             | pinned base `openclaw/openclaw:2026.10.10` + hyperon + vendored NAL/PLN libs (`/opt/sut-metta/`) — nothing else mutated |
+| wrapper image             | pinned base `openclaw/openclaw:2026.10.10` + the upstream-pinned MeTTa runtime (SWI-Prolog 10.0.2 + PeTTa v1.0.4 + vendored NAL/PLN libs in `/opt/sut-metta/` — provenance below) — nothing else mutated |
 | `openclaw-sut-workspace` | named volume → `/var/openclaw/workspace`: seeded scaffold (`workspace-seed/`) + the six skills (`<repo>/skills-sut/`) |
 | `openclaw-sut-state`     | named volume → `/var/openclaw/state` (`OPENCLAW_STATE_DIR`): onboarded config + sessions — survives container recreation |
 | DAS network              | gateway attached to `omega-das-integration-client` (write bridge + read proxy origins into the runtime env) |
@@ -30,8 +30,9 @@ Spec: `specs/openclaw-sut-adapter/spec.md` (R-D1..R-D8).
 - the **Omega agent stopped** (`sudo systemctl stop omega-curiosity.service`)
   — the ASI1 key quota is shared; deploy.sh refuses to run while it is up
 - the vendored `lib_nal.metta` + `lib_pln.metta` committed under
-  `metta-libs/` (extract verbatim from `omegaclaw:v0.1.23-6376e99` — see
-  `metta-libs/README.md`; stage 2 fails fast without them)
+  `metta-libs/` (fetch from upstream singnet/Omega @ `b94f7bf44e10852e491967191f1c68643dc9ca90`
+  and verify the sha256s — see `metta-libs/README.md`; stage 2 fails fast
+  without them)
 - the orchestrator **secrets env file** (outside this repo, never committed),
   shell `KEY=VALUE` lines:
   - `OPENCLAW_SUT_ASI1_API_KEY` — the ASI1 provider key
@@ -98,6 +99,26 @@ cd deploy/openclaw-sut
     benchmark skills (das-write, das-retrieve, metta, pin,
     das-extract-knowledge, das-grounded-reasoning) appear in
     `skills list`; (c) a deployment report (no secrets).
+
+## MeTTa runtime provenance (spec addendum — upstream-pinned, repeatable by anyone)
+
+The wrapper image's MeTTa runtime is pulled ENTIRELY from upstream pins
+(the same runtime the Omega arm uses, at the same versions); there is NO
+dependency on any omega-built artifact:
+
+| Piece            | Upstream                                                   | Pin                                            | How the build pulls it |
+| ---------------- | ---------------------------------------------------------- | ---------------------------------------------- | --------------------- |
+| SWI-Prolog       | https://hub.docker.com/_/swipl — official image             | `docker.io/library/swipl:10.0.2`               | `COPY --from=docker.io/library/swipl:10.0.2` (binary `/usr/bin/swipl`, home `/usr/lib/swipl`, plus the two shared libs the slim base lacks: `libtcmalloc_minimal.so.4`, `libpython3.11.so.1.0` — the exact DT_NEEDED delta) |
+| PeTTa            | https://github.com/trueagi-io/PeTTa.git                     | v1.0.4 = commit `7037f4c2ad378c52fc328004fe216d5118b674f0` | build-stage `git clone` + `git checkout` of the pinned commit; only `src/*.pl` is kept (nothing from PeTTa's `build.sh` — no faiss/mork/chroma) |
+| NAL/PLN libs     | https://github.com/singnet/Omega.git                        | commit `b94f7bf44e10852e491967191f1c68643dc9ca90` | vendored in-repo (`metta-libs/`, sha256-verified — repeat-fetch in `metta-libs/README.md`), `COPY` at build |
+
+`skills-sut/metta/metta_run.py` invokes it exactly as the omegaclaw
+runtime does: `swipl --stack_limit=8g -q -s src/main.pl -- <file>` with
+`cwd=/opt/petta`, a fresh swipl process per call (ephemeral atomspace).
+The build itself gates the runtime: a NAL probe must yield an `(stv ...)`
+result line or the image build fails. The `omegaclaw:v0.1.23-6376e99`
+container is used only as a CROSS-CHECK of these pins (comparability
+proof in the spec addendum), never as a source.
 
 ## Verification gates
 
