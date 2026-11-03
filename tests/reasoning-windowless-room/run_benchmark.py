@@ -1756,6 +1756,31 @@ def _delivery_command(args, case_id: str) -> list[str]:
     ]
 
 
+def _wait_for_gateway_ready(profile, timeout_s: float = 180.0,
+                            poll_interval_s: float = 5.0) -> bool:
+    """R-A2 delivery readiness: the per-case restart recreates the SUT
+    gateway container (systemctl restart openclaw-sut.service → compose
+    down/up). A docker exec started mid-recreation exits nonzero without
+    creating a session — the first delivery per case would die silently
+    and only the 15-min stall-window re-issue would recover it. Poll
+    until the in-container gateway CLI answers (openclaw status, exit
+    0), bounded by timeout_s; False on timeout."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            proc = subprocess.run(
+                ["docker", "exec", profile.container_agent,
+                 "openclaw", "status"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=60)
+            if proc.returncode == 0:
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        time.sleep(poll_interval_s)
+    return False
+
+
 def _start_agent_turn(args, case_id: str) -> bool:
     """Start the delivery turn (non-blocking Popen, output discarded — the
     gateway container's own logs carry the turn transcript; the receipts
@@ -1768,6 +1793,14 @@ def _start_agent_turn(args, case_id: str) -> bool:
         print(f"[delivery] [dry-run] would start the agent turn: "
               f"{shlex.join(cmd)}")
         return True
+    # R-A2 delivery readiness: the per-case restart may have recreated
+    # the gateway container; a docker exec started mid-recreation exits
+    # nonzero without creating a session. Wait for the gateway CLI to
+    # answer before starting the turn.
+    if not _wait_for_gateway_ready(profile):
+        print(f"[delivery] ERROR: gateway not ready after wait "
+              f"(case {case_id})")
+        return False
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
