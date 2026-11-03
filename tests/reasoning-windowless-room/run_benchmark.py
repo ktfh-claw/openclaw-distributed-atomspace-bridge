@@ -2693,7 +2693,7 @@ def grade_case(args) -> int:
                        "memory_volume": _memory_volume(args)}
                       if _profile(args) is not OMEGA_PROFILE else {})
     receipt_census = _census_persist_receipts(
-        live_since_iso, _now_iso(), extra_logs=phase1_logs, **census_kwargs)
+        since_iso, _now_iso(), extra_logs=phase1_logs, **census_kwargs)
     _write_json(rd / f"persist-receipts-{args.case}.json", receipt_census)
     window_receipt_count = len(persist_receipts)
     if receipt_census.get("count", 0) > 0:
@@ -2707,7 +2707,7 @@ def grade_case(args) -> int:
     # v2: phase-1 pins come from the phase1-docker.log snapshot (same
     # merge as the persist-receipt census).
     ledger_pin_census = _census_ledger_pins(
-        live_since_iso, _now_iso(), extra_logs=phase1_logs,
+        since_iso, _now_iso(), extra_logs=phase1_logs,
         profile=_profile(args))
     _write_json(rd / f"ledger-pins-{args.case}.json", ledger_pin_census)
     adherence = _adherence_lane(args.case, ledger_pin_census, answers)
