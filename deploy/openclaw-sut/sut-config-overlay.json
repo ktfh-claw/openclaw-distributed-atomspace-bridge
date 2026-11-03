@@ -1,7 +1,8 @@
 {
   "agents": {
     "defaults": {
-      "workspace": "/var/openclaw/workspace"
+      "workspace": "/var/openclaw/workspace",
+      "timeoutSeconds": 1800
     },
     "entries": {
       "main": {
