@@ -1,0 +1,28 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "/var/openclaw/workspace"
+    }
+  },
+  "tools": {
+    "profile": "minimal",
+    "alsoAllow": ["read", "write", "edit", "apply_patch", "exec"],
+    "deny": [
+      "group:web", "web_search", "x_search", "web_fetch",
+      "group:ui", "browser", "screen",
+      "group:messaging", "message",
+      "group:nodes", "group:media", "group:agents", "group:memory",
+      "group:sessions", "sessions_send", "sessions_spawn",
+      "conversations_send", "conversations_turn", "subagents",
+      "group:plugins", "skill_workshop", "skill_library",
+      "automations", "cron"
+    ]
+  },
+  "cron": {
+    "enabled": false,
+    "triggers": { "enabled": false }
+  },
+  "plugins": {
+    "allow": ["telegram"]
+  }
+}

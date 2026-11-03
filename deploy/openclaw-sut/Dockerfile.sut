@@ -1,0 +1,54 @@
+# Dockerfile.sut — OpenClaw-SUT wrapper image (spec R-D2).
+#
+# Wrapper stage on the pinned base tag openclaw/openclaw:2026.10.10 (index
+# digest sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799,
+# verified by deploy.sh stage 2 at pull). It installs ONLY the MeTTa runtime
+# (hyperon via pip, plus python3 if the base lacks it) and the vendored
+# NAL/PLN libraries under /opt/sut-metta/ (committed by the orchestrator —
+# see metta-libs/README.md; extracted verbatim from
+# omegaclaw:v0.1.23-6376e99). No other mutation of the base image.
+FROM openclaw/openclaw:2026.10.10
+
+USER root
+
+# MeTTa runtime: python3 + pip (only if the base lacks them — idempotent
+# install, both Debian/apt and Alpine/apk bases covered) + the hyperon
+# package.
+RUN set -eux; \
+    if ! command -v python3 >/dev/null 2>&1; then \
+        if command -v apt-get >/dev/null 2>&1; then \
+            apt-get update; \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-pip; \
+            rm -rf /var/lib/apt/lists/*; \
+        elif command -v apk >/dev/null 2>&1; then \
+            apk add --no-cache python3 py3-pip; \
+        else \
+            echo "ERROR: no supported package manager to install python3" >&2; exit 1; \
+        fi; \
+    elif ! python3 -m pip --version >/dev/null 2>&1; then \
+        if command -v apt-get >/dev/null 2>&1; then \
+            apt-get update; \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-pip; \
+            rm -rf /var/lib/apt/lists/*; \
+        elif command -v apk >/dev/null 2>&1; then \
+            apk add --no-cache py3-pip; \
+        fi; \
+    fi; \
+    python3 -m pip install --no-cache-dir hyperon \
+        || python3 -m pip install --no-cache-dir --break-system-packages hyperon; \
+    python3 -c "import hyperon; print('hyperon', hyperon.__version__ if hasattr(hyperon, '__version__') else 'ok')"
+
+# Mountpoints for the named volumes (deploy.sh stage 3 seeds the workspace;
+# the state volume carries the onboarded config). The image's non-root user
+# is node (uid 1000) — the harness's openclaw profile chowns benchmark
+# artifacts to 1000:1000 to match. If the pinned image's default user ever
+# differs, verify at smoke and adjust both this chown and the profile.
+RUN set -eux; \
+    mkdir -p /var/openclaw/state /var/openclaw/workspace /opt/sut-metta; \
+    chown -R 1000:1000 /var/openclaw
+
+# Vendored NAL/PLN libraries (verbatim from omegaclaw:v0.1.23-6376e99;
+# orchestrator-committed — the build fails without them by design).
+COPY metta-libs/lib_nal.metta metta-libs/lib_pln.metta /opt/sut-metta/
+
+USER node

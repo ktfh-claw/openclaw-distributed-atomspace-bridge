@@ -1,0 +1,155 @@
+# OpenClaw-SUT deployment (windowless-room benchmark arm)
+
+Deploy **OpenClaw as the agent under test ("OpenClaw-SUT")** for the
+windowless-room reasoning benchmark, as a bridge-only adaptation: the
+pinned upstream image is consumed as-is (never forked or patched), and
+everything else — the six benchmark skills, the wrapper image stage, the
+compose stack, this script — lives in this repo. The DAS deployment
+(write bridge / read proxy / query engine / mongodb) is untouched and is
+addressed over the existing `omega-das-integration-client` docker network.
+
+**The deployment SCRIPT is authoritative — this README documents it.**
+Spec: `specs/openclaw-sut-adapter/spec.md` (R-D1..R-D8).
+
+## What is deployed
+
+| Piece                     | What                                                        |
+| ------------------------- | ----------------------------------------------------------- |
+| `openclaw-sut-gateway`    | gateway container from `openclaw-sut:2026.10.10-metta1`     |
+| wrapper image             | pinned base `openclaw/openclaw:2026.10.10` + hyperon + vendored NAL/PLN libs (`/opt/sut-metta/`) — nothing else mutated |
+| `openclaw-sut-workspace` | named volume → `/var/openclaw/workspace`: seeded scaffold (`workspace-seed/`) + the six skills (`<repo>/skills-sut/`) |
+| `openclaw-sut-state`     | named volume → `/var/openclaw/state` (`OPENCLAW_STATE_DIR`): onboarded config + sessions — survives container recreation |
+| DAS network              | gateway attached to `omega-das-integration-client` (write bridge + read proxy origins into the runtime env) |
+| Telegram channel         | operator oversight only; token stays in the environment (`--use-env`) |
+| systemd unit             | `openclaw-sut.service`: stop = `docker compose down`, start = `up -d` → `systemctl restart` RECREATES the container; ExecStartPost re-attaches the DAS network |
+
+## Host prerequisites (orchestrator, on the OVH deploy host)
+
+- docker + compose v2
+- the DAS compose stack running (network `omega-das-integration-client`)
+- the **Omega agent stopped** (`sudo systemctl stop omega-curiosity.service`)
+  — the ASI1 key quota is shared; deploy.sh refuses to run while it is up
+- the vendored `lib_nal.metta` + `lib_pln.metta` committed under
+  `metta-libs/` (extract verbatim from `omegaclaw:v0.1.23-6376e99` — see
+  `metta-libs/README.md`; stage 2 fails fast without them)
+- the orchestrator **secrets env file** (outside this repo, never committed),
+  shell `KEY=VALUE` lines:
+  - `OPENCLAW_SUT_ASI1_API_KEY` — the ASI1 provider key
+  - `OPENCLAW_SUT_TELEGRAM_BOT_TOKEN` — the Telegram bot token
+  - `OPENCLAW_SUT_GATEWAY_TOKEN` — the OpenClaw Gateway auth token
+
+  deploy.sh stage 4 derives the runtime env from it (`OPENAI_API_KEY`,
+  `CUSTOM_API_KEY`, `TELEGRAM_BOT_TOKEN`, `OPENCLAW_GATEWAY_TOKEN`) +
+  the discovered DAS origins, writes `runtime.env` (umask 077, gitignored),
+  and aborts naming the missing variable — secret VALUES are never echoed,
+  catted, or logged (no `set -x` anywhere).
+
+## Running the deploy (single entry point)
+
+```bash
+cd deploy/openclaw-sut
+./deploy.sh --secrets-file /path/to/orchestrator-secrets.env
+```
+
+## The 10 stages (ordered, fail-fast, individually idempotent)
+
+1. **preflight** — docker + compose v2 present; `omega-curiosity` not
+   running (clear abort message otherwise); DAS client network exists;
+   the secrets env file exists and is non-empty; the deploy assets exist.
+2. **build** — pull `openclaw/openclaw:2026.10.10`, verify its index digest
+   is `sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799`,
+   build `openclaw-sut:2026.10.10-metta1` from `Dockerfile.sut`.
+3. **volume + seed** — create `openclaw-sut-workspace`, seed it once from
+   `workspace-seed/` (AGENTS.md, standby `prompt.txt`, empty
+   `history.metta`, `benchmark/` scaffold: answers.md, facts-index.md,
+   urls.txt, pinned-ledger.md, knowledge-checkpoints/) plus the six skills
+   from `<repo>/skills-sut/`; the `.sut-seeded` marker makes it idempotent
+   (delete the marker — or the volume — to reseed).
+4. **runtime env** — write `runtime.env` from the orchestrator secrets
+   (abort on empty values, names only) + the write-bridge/read-proxy IPs
+   discovered on the DAS client network.
+5. **onboard + overlay** — non-interactive headless onboarding via the
+   official Docker pattern (`compose run --entrypoint node`): token auth
+   via the `OPENCLAW_GATEWAY_TOKEN` env SecretRef, OpenAI-compatible
+   custom provider = ASI1 (`CUSTOM_API_KEY` env ref,
+   `https://api.asi1.ai/v1`, model `asi1-ultra`), `--skip-channels
+   --no-install-daemon --skip-bootstrap` (the seeded AGENTS.md stays the
+   only standing instruction). Then apply `sut-config-overlay.json` via
+   `config patch --file`: workspace root `/var/openclaw/workspace`, tool
+   policy minimal + file/exec only, explicit denies (web/browser/messaging/
+   sends/plugins marketplaces), `cron.enabled=false` + `triggers.enabled=false`
+   (turns happen only when the harness delivers them), plugins allowlist
+   `["telegram"]`. Heartbeat off via `system heartbeat disable` (tolerant —
+   cron config is the hard gate).
+6. **telegram** — `channels add --channel telegram --use-env` (token from
+   `TELEGRAM_BOT_TOKEN` env only; never copied into the config).
+7. **up** — `docker compose up -d`; connect the gateway to
+   `omega-das-integration-client` (skip if already attached).
+8. **provider verify** — a REAL one-token completion against
+   `https://api.asi1.ai/v1` using the exact provider credential the SUT
+   turns use (`CUSTOM_API_KEY`, read from the container env inside the
+   python process — never on a command line). HTTP 401/403 aborts with:
+   *"re-request the OPENCLAW_SUT_ASI1_API_KEY secret"*.
+9. **DAS lanes** — TCP reach of the write bridge + read proxy origins from
+   inside the SUT container (same origins the skills use).
+10. **smoke** — (a) metta runtime check: `(|- ...)` evaluates through the
+    SUT metta skill with `(stv ...)` output (scratch workspace, so the
+    smoke never touches the seeded ledger); (b) skill-visibility: the six
+    benchmark skills (das-write, das-retrieve, metta, pin,
+    das-extract-knowledge, das-grounded-reasoning) appear in
+    `skills list`; (c) a deployment report (no secrets).
+
+## Verification gates
+
+- Stage 2's digest check pins the base image byte-for-byte.
+- Stage 8 proves the provider credentials work through the SUT's own
+  env-ref path before any benchmark run.
+- Stage 9 proves the DAS lanes are reachable from the SUT container.
+- Stage 10 proves the MeTTa runtime + vendored libs work and the skills
+  are visible — the exact capabilities the graded turns depend on.
+- The harness adds its own preflight assertions (run_benchmark.py
+  `--agent-profile openclaw preflight`): gateway on the DAS network with
+  a reachable IP, workspace volume present, `benchmark/` artifacts
+  creatable, both DAS lanes reachable from the SUT, and the Omega agent
+  container ABSENT/STOPPED (shared key quota).
+
+## Harness invocation (openclaw profile)
+
+From `tests/reasoning-windowless-room/` on the host with this checkout:
+
+```bash
+python3 run_benchmark.py --agent-profile openclaw preflight --run-id <run-id>
+python3 run_benchmark.py --agent-profile openclaw full --two-phase --run-id <run-id>
+```
+
+- prompt delivery: the harness writes the rendered `prompt.txt` into the
+  workspace volume exactly as for Omega and then starts a real gateway turn:
+  `docker exec openclaw-sut-gateway openclaw agent --message-file
+  /var/openclaw/workspace/prompt.txt --session-id wr-<run_id>-<case_id>
+  --no-color` (non-blocking; re-issued on nonzero exit or a stall via the
+  existing stall/phase-timeout machinery)
+- receipts census: docker logs (primary) ∪
+  `benchmark/persist-receipts.log` sidecar (ISO-8601 lines appended by the
+  das-write skill), identical `(timestamp, handle)` dedup
+- restarts: `sudo systemctl restart openclaw-sut.service` (recreates the
+  container; the unit re-attaches the DAS network)
+- `--dry-run` prints the full profile-resolved plan (including the exact
+  delivery command) without touching docker.
+
+## Smoke-time verifications (orchestrator, S4)
+
+- the pinned image's `openclaw` binary is on the container PATH (the frozen
+  delivery command uses `docker exec <container> openclaw agent ...`; if the
+  image only exposes `node /app/dist/index.js`, report back — do not invent
+  a different delivery)
+- onboarding/config-patch flag surfaces against the pinned tag (this script
+  follows the documented `2026.10.x` CLI surface: `onboard --non-interactive
+  --accept-risk --skip-health --mode local --auth-choice custom-api-key
+  --custom-base-url --custom-model-id --custom-compatibility openai
+  --secret-input-mode ref --gateway-auth token --gateway-token-ref-env
+  --skip-channels --no-install-daemon --skip-bootstrap`, `config patch
+  --file`, `channels add --channel telegram --use-env`, `skills list`,
+  `system heartbeat disable`)
+- the seeded `AGENTS.md` is injected into turns (bootstrap skipped)
+- skill-script stdout visible in `docker logs` (the receipts sidecar removes
+  the hard dependency; the E-gate census is robust either way)
