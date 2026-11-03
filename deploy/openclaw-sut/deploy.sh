@@ -247,7 +247,17 @@ stage5_onboard() {
   fi
 
   log "stage 5/10: applying the benchmark config overlay (sut-config-overlay.json)"
-  sut_cli config patch --file /var/openclaw/sut-config-overlay.json
+  # Fix (orchestrator, 2026-11-03): The config patch must run INSIDE the
+  # gateway container when it is running, to avoid a PID-namespace ownership
+  # conflict. When the gateway is not running (fresh deploy), fall back to
+  # the temp-container (sut_cli) path.
+  if docker compose exec -T gateway node dist/index.js config patch \
+      --file /var/openclaw/sut-config-overlay.json 2>/dev/null; then
+    log "stage 5/10: config overlay applied (in-container)"
+  else
+    # Try the temp-container path (fresh deploy: gateway not yet running)
+    sut_cli config patch --file /var/openclaw/sut-config-overlay.json
+  fi
 
   # autonomous/scheduled OFF is enforced by the overlay (cron.enabled=false);
   # heartbeat off is defense-in-depth via the CLI (tolerant: the overlay is
