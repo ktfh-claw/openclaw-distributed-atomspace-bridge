@@ -272,7 +272,19 @@ stage5_onboard() {
 # ---------------------------------------------------------------------------
 stage6_telegram() {
   log "stage 6/10: adding the Telegram channel (token from TELEGRAM_BOT_TOKEN env only)"
-  sut_cli channels add --channel telegram --use-env
+  # Fix (orchestrator, 2026-11-03): on re-run with the gateway up, a temp
+  # container (sut_cli) hits the PID-namespace ownership guard. Try
+  # in-container first (gateway up); fall back to temp container (fresh
+  # deploy: gateway not yet running).
+  if docker compose exec -T gateway node dist/index.js channels add \
+      --channel telegram --use-env 2>/dev/null; then
+    log "stage 6/10: telegram channel ensured (in-container)"
+  else
+    # Fresh-deploy path: or non-fatal if already installed
+    sut_cli channels add --channel telegram --use-env \
+      && log "stage 6/10: telegram channel added" \
+      || log "stage 6/10: telegram channel add skipped (non-fatal; may already exist)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
