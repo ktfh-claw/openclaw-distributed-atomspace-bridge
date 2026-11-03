@@ -360,7 +360,11 @@ stage10_smoke() {
   # OPENCLAW_SUT_WORKSPACE is pointed at a scratch dir so the smoke episode
   # does not touch the seeded workspace's history.metta ledger.
   local metta_out
-  if metta_out="$(sut_exec -e OPENCLAW_SUT_WORKSPACE=/tmp/sut-smoke python3 \
+  # NOTE: `docker compose exec` requires env-var options BEFORE the service
+  # name; passing `-e` after `gateway` makes the container try to exec `-e`
+  # as the executable (RCA of the first smoke failure). Using `env` inside
+  # the container sets the var correctly on any base.
+  if metta_out="$(sut_exec env OPENCLAW_SUT_WORKSPACE=/tmp/sut-smoke python3 \
       /var/openclaw/workspace/skills/metta/metta_run.py \
       '(|- ((--> smoke-a smoke-b) (stv 1.0 0.9)) ((--> smoke-a smoke-c) (stv 1.0 0.9)))' 2>&1)"; then
     case "$metta_out" in
