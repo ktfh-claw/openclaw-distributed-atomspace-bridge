@@ -2,6 +2,11 @@
   "agents": {
     "defaults": {
       "workspace": "/var/openclaw/workspace"
+    },
+    "entries": {
+      "main": {
+        "workspace": "/var/openclaw/workspace"
+      }
     }
   },
   "tools": {
