@@ -1,0 +1,39 @@
+# openclaw-sut.service — systemd unit for the OpenClaw-SUT gateway
+# (spec R-D5). Mirrors the Omega start.sh restart semantics for the harness
+# restart path (`sudo systemctl restart openclaw-sut.service`): stop =
+# `docker compose down` (removes containers), start = `docker compose up -d`
+# (fresh containers) — a restart RECREATES rather than reuses, so each case
+# window starts from a fresh gateway container (the state volume persists
+# the onboarded config; the harness trims the workspace's history.metta per
+# case and restores prompt.txt at teardown).
+#
+# ExecStartPost re-attaches the gateway container to the DAS client network
+# (a fresh container joins only the compose network; the SUT skills address
+# the write bridge / read proxy over omega-das-integration-client).
+#
+# INSTALL (orchestrator, on the deploy host):
+#   sudo cp openclaw-sut.service /etc/systemd/system/openclaw-sut.service
+#   # adjust WorkingDirectory below to THIS repo checkout's
+#   # deploy/openclaw-sut directory on the host, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable openclaw-sut.service
+[Unit]
+Description=OpenClaw-SUT gateway (windowless-room benchmark arm)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ubuntu
+Group=ubuntu
+SupplementaryGroups=docker
+# ADJUST to the host checkout: <repo>/deploy/openclaw-sut
+WorkingDirectory=/home/ubuntu/openclaw-distributed-atomspace-bridge/deploy/openclaw-sut
+ExecStart=/usr/bin/docker compose up -d
+ExecStartPost=/bin/sh -c 'docker network inspect -f "{{range .Containers}}{{.Name}} {{end}}" omega-das-integration-client 2>/dev/null | grep -qw openclaw-sut-gateway || docker network connect omega-das-integration-client openclaw-sut-gateway'
+ExecStop=-/usr/bin/docker compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
