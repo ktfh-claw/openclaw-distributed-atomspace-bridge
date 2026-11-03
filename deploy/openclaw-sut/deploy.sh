@@ -217,21 +217,34 @@ stage4_runtime_env() {
 # ---------------------------------------------------------------------------
 stage5_onboard() {
   log "stage 5/10: onboarding the gateway (non-interactive, headless pattern)"
+  # Idempotency (orchestrator fix 2026-11-03): if /var/openclaw/state/openclaw.json
+  # already exists (prior successful onboarding), skip the onboard CLI call
+  # entirely — re-running onboard against existing state fails generically.
+  # The overlay patch below is still applied unconditionally (it is idempotent).
+  #
   # Official headless bootstrap flags (docs.openclaw.ai/install/docker):
   # token auth via the OPENCLAW_GATEWAY_TOKEN env SecretRef, OpenAI-compatible
   # custom provider = ASI1 (CUSTOM_API_KEY env ref, base URL, model), skip
   # channels/daemon/bootstrap. --skip-bootstrap keeps the seeded AGENTS.md the
   # only standing instruction (workspace-seed/ owns the workspace files).
-  sut_cli onboard \
-    --non-interactive --accept-risk --skip-health --mode local \
-    --auth-choice custom-api-key \
-    --custom-base-url "$ASI1_BASE_URL" \
-    --custom-model-id "$ASI1_MODEL" \
-    --custom-compatibility openai \
-    --secret-input-mode ref \
-    --gateway-auth token \
-    --gateway-token-ref-env OPENCLAW_GATEWAY_TOKEN \
-    --skip-channels --no-install-daemon --skip-bootstrap
+  # Idempotency guard: check if the state volume already has an onboarded
+  # config. If so, skip the onboard CLI call (it fails on re-run) and go
+  # straight to the overlay patch (which is independently idempotent).
+  if docker compose run -T --rm --no-deps --entrypoint sh gateway \
+      -c "test -f /var/openclaw/state/openclaw.json" 2>/dev/null; then
+    log "stage 5/10: gateway already onboarded — skipping onboard CLI (idempotent re-run)"
+  else
+    sut_cli onboard \
+      --non-interactive --accept-risk --skip-health --mode local \
+      --auth-choice custom-api-key \
+      --custom-base-url "$ASI1_BASE_URL" \
+      --custom-model-id "$ASI1_MODEL" \
+      --custom-compatibility openai \
+      --secret-input-mode ref \
+      --gateway-auth token \
+      --gateway-token-ref-env OPENCLAW_GATEWAY_TOKEN \
+      --skip-channels --no-install-daemon --skip-bootstrap
+  fi
 
   log "stage 5/10: applying the benchmark config overlay (sut-config-overlay.json)"
   sut_cli config patch --file /var/openclaw/sut-config-overlay.json
