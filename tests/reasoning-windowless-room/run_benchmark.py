@@ -58,6 +58,15 @@ Restart invariant: the agent is restarted via
 ``sudo systemctl restart omega-curiosity.service`` — NOT ``docker restart`` —
 because the unit's ``start.sh`` trap ``rm -f``'s the container (a docker
 restart would destroy the container).
+
+Agent profiles (OpenClaw-SUT adapter, specs/openclaw-sut-adapter/spec.md):
+every agent-side constant (container name, memory volume, prompt-relative
+artifact paths, state file, restart command, docker-log census source) resolves
+through an explicit ``--agent-profile`` seam (default ``omega`` = today's
+behavior, byte-for-byte; ``openclaw`` = the OpenClaw-SUT gateway: prompt
+delivery via ``docker exec ... openclaw agent --message-file ...`` plus the
+receipts-sidecar census union). The DAS-side containers and the
+``omega-das-integration-client`` network are shared by both profiles.
 """
 from __future__ import annotations
 
@@ -71,6 +80,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -108,6 +118,132 @@ BENCH_PROMPT_REL = "repos/Omega/memory/benchmark"
 ANSWERS_PROMPT_REL = f"{BENCH_PROMPT_REL}/answers.md"
 FACTS_INDEX_PROMPT_REL = f"{BENCH_PROMPT_REL}/facts-index.md"
 URLS_PROMPT_REL = f"{BENCH_PROMPT_REL}/urls.txt"
+
+# ---------------------------------------------------------------------------
+# Agent profiles (OpenClaw-SUT adapter, R-A1..R-A6). Every place that used to
+# read the hard-coded agent constants above now resolves through the
+# profile. The omega profile IS today's constants (byte-for-byte behavior);
+# the openclaw profile points the same harness at the OpenClaw-SUT gateway
+# container + workspace volume. The DAS-side containers
+# (CONTAINER_WRITE_BRIDGE/READ_PROXY/QUERY_ENGINE/MONGODB) and the
+# omega-das-integration-client network are shared by both profiles and stay
+# exactly as they are.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AgentProfile:
+    """One agent-under-test profile (spec: "The seam the harness must
+    parameterize"). ``restart_cmd`` is the sudo-less argv (``_sudo_run``
+    prepends sudo — the omega entry resolves to the exact
+    ``sudo systemctl restart omega-curiosity.service`` of today)."""
+
+    name: str
+    container_agent: str
+    memory_volume_default: str
+    bench_prompt_rel: str
+    state_file: str
+    restart_cmd: list[str] = field(default_factory=list)
+    prompt_delivery: str = "restart_only"
+    receipts_source: str = "docker_logs"
+    bench_owner: str = "65534:65534"
+    prompt_abs_in_container: str | None = None
+    workspace_abs_in_container: str = "/PeTTa/repos/Omega/memory"
+
+    @property
+    def answers_prompt_rel(self) -> str:
+        return f"{self.bench_prompt_rel}/answers.md"
+
+    @property
+    def facts_index_prompt_rel(self) -> str:
+        return f"{self.bench_prompt_rel}/facts-index.md"
+
+    @property
+    def urls_prompt_rel(self) -> str:
+        return f"{self.bench_prompt_rel}/urls.txt"
+
+    @property
+    def delivers_agent_turn(self) -> bool:
+        return self.prompt_delivery == "file_plus_agent_turn"
+
+    @property
+    def uses_receipts_sidecar(self) -> bool:
+        return self.receipts_source == "docker_logs_and_receipts_file"
+
+
+OMEGA_PROFILE = AgentProfile(
+    name="omega",
+    container_agent=CONTAINER_AGENT,
+    memory_volume_default=DEFAULT_MEMORY_VOLUME,
+    bench_prompt_rel=BENCH_PROMPT_REL,
+    state_file="omega_state.md",
+    restart_cmd=["systemctl", "restart", "omega-curiosity.service"],
+    prompt_delivery="restart_only",
+    receipts_source="docker_logs",
+    # the omega agent container runs as nobody:nogroup (start.sh mounts the
+    # volume into a container whose file tools write as 65534)
+    bench_owner="65534:65534",
+    prompt_abs_in_container=None,
+    # the Omega memory volume's in-container mount point (prompt-rendered
+    # absolute paths reference it)
+    workspace_abs_in_container="/PeTTa/repos/Omega/memory",
+)
+
+OPENCLAW_PROFILE = AgentProfile(
+    name="openclaw",
+    container_agent="openclaw-sut-gateway",
+    memory_volume_default="/var/lib/docker/volumes/openclaw-sut-workspace/_data",
+    # the SUT workspace root is the container cwd: benchmark-relative artifact
+    # paths in the rendered prompt resolve directly (the openclaw profile's
+    # answer to the v11 omega cwd lesson)
+    bench_prompt_rel="benchmark",
+    # OpenClaw has no equivalent single state file: prompt.txt IS the state
+    # (standby content at standby, benchmark content during a run) — the
+    # prompt backup/restore gives it standby/backup/restore parity
+    state_file="prompt.txt",
+    restart_cmd=["systemctl", "restart", "openclaw-sut.service"],
+    prompt_delivery="file_plus_agent_turn",
+    receipts_source="docker_logs_and_receipts_file",
+    # the OpenClaw image runs as the `node` user (uid 1000)
+    bench_owner="1000:1000",
+    # workspace volume is mounted at /var/openclaw/workspace (R-D3/R-D4)
+    prompt_abs_in_container="/var/openclaw/workspace/prompt.txt",
+    workspace_abs_in_container="/var/openclaw/workspace",
+)
+
+AGENT_PROFILES: dict[str, AgentProfile] = {
+    "omega": OMEGA_PROFILE,
+    "openclaw": OPENCLAW_PROFILE,
+}
+
+
+def _profile(args) -> AgentProfile:
+    """Resolve the agent profile from parsed args (default: omega)."""
+    name = getattr(args, "agent_profile", "") or "omega"
+    prof = AGENT_PROFILES.get(name)
+    if prof is None:
+        raise SystemExit(
+            f"unknown --agent-profile: {name} (valid: {sorted(AGENT_PROFILES)})")
+    return prof
+
+
+def _memory_volume(args) -> str:
+    """The agent memory volume root: explicit --memory-volume wins; the
+    profile default otherwise (omega: today's DEFAULT_MEMORY_VOLUME)."""
+    vol = getattr(args, "memory_volume", "") or ""
+    return vol if vol else _profile(args).memory_volume_default
+
+
+def _restart_command(profile: AgentProfile) -> list[str]:
+    """The full restart argv (sudo included) — the spec profile table's
+    ``restart`` entry, as one testable unit."""
+    return ["sudo", *profile.restart_cmd]
+
+
+# R-A3: the receipts sidecar the das-write skill appends to under the
+# workspace root (openclaw profile only). One line per receipt:
+# ``<ISO8601-UTC> BRIDGE-PERSIST-OK: verified=<n> top=<handle>``.
+RECEIPTS_SIDECAR_REL = f"{BENCH_REL}/persist-receipts.log"
 
 # v4 (lever 3 of the wr3b post-mortem, 2026-10-24): the stock agent appends
 # every episode to history.metta and serializes the WHOLE file into every
@@ -208,7 +344,13 @@ def _pick_agent_ip(ips: list[str], bridge_ip: str) -> str:
     return ips[0]
 
 
-def _container_ip(container: str) -> str:
+def _container_ip(container: str, agent_container: str | None = None) -> str:
+    """Resolve a container's IP; the agent container (whichever profile is
+    active) gets the _pick_agent_ip multi-network treatment. The default
+    keeps the historical one-argument call sites (and their test stubs)
+    byte-identical for the omega profile."""
+    if agent_container is None:
+        agent_container = CONTAINER_AGENT
     try:
         result = _run([
             "docker", "inspect", "--format",
@@ -216,7 +358,7 @@ def _container_ip(container: str) -> str:
             container,
         ])
         ips = [ip for ip in result.stdout.split() if ip]
-        if container == CONTAINER_AGENT:
+        if container == agent_container:
             return _pick_agent_ip(ips, _container_ip(CONTAINER_WRITE_BRIDGE))
         return ips[0] if ips else ""
     except Exception:
@@ -245,8 +387,9 @@ def _case_by_id(case_id: str) -> dict | None:
     return None
 
 
-def _bench_paths(args) -> dict[str, Path]:
-    vol = Path(args.memory_volume)
+def _bench_paths(args) -> dict[str, Path | None]:
+    profile = _profile(args)
+    vol = Path(_memory_volume(args))
     return {
         "vol": vol,
         "bench": vol / BENCH_REL,
@@ -254,8 +397,13 @@ def _bench_paths(args) -> dict[str, Path]:
         "facts_index": vol / FACTS_INDEX_REL,
         "urls": vol / URLS_REL,
         "prompt": vol / "prompt.txt",
-        "state": vol / "omega_state.md",
+        # omega: omega_state.md (as today); openclaw: prompt.txt IS the state
+        # (standby/backup/restore parity — the prompt backup covers it)
+        "state": vol / profile.state_file,
         "history": vol / "history.metta",
+        # openclaw only (R-A3); None for the omega profile
+        "receipts_sidecar": (vol / RECEIPTS_SIDECAR_REL
+                             if profile.uses_receipts_sidecar else None),
     }
 
 
@@ -293,6 +441,103 @@ def _docker_logs_since(container: str, since_iso: str, until_iso: str) -> str:
 PERSIST_RECEIPT_RE = re.compile(
     r"BRIDGE-PERSIST-OK: verified=\d+ top=[0-9a-f]{32}")
 
+# R-A3 (openclaw profile): the das-write skill appends one sidecar line per
+# receipt — ``<ISO8601-UTC> BRIDGE-PERSIST-OK: verified=<n> top=<handle>`` —
+# to <memory-volume>/benchmark/persist-receipts.log. Rationale: OpenClaw
+# tool stdout is not guaranteed to reach docker logs; the sidecar makes the
+# E_NO_INGEST census robust without touching gate code. The receipt
+# regex/payload is identical in both census sources.
+SIDECAR_RECEIPT_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+"
+    r"(BRIDGE-PERSIST-OK: verified=\d+ top=[0-9a-f]{32})")
+RECEIPT_HANDLE_RE = re.compile(r"top=([0-9a-f]{32})")
+
+
+def _parse_iso_utc(text: str) -> datetime | None:
+    """Parse an ISO-8601 UTC second-resolution timestamp; None on failure."""
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _docker_log_timestamp(line: str) -> datetime | None:
+    """Parse a ``docker logs --timestamps`` RFC3339 prefix (second or
+    nanosecond precision) to a UTC datetime; None when absent."""
+    token = line.split(" ", 1)[0] if line else ""
+    if not token.endswith("Z"):
+        return None
+    # nanosecond precision: truncate the fraction to microseconds for parsing
+    head, sep, frac = token.partition(".")
+    if sep:
+        whole, _, _z = frac.partition("Z")
+        token = f"{head}.{whole[:6]}Z" if whole else token
+    if "." in token:
+        try:
+            return datetime.strptime(
+                token, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return _parse_iso_utc(token)
+
+
+def _receipt_pair_key(line: str, ts: datetime | None) -> tuple:
+    """The (timestamp, handle) census identity of one matched receipt line.
+
+    Timestamps are compared at the SIDECAR's one-second resolution (the
+    skill writes ``%Y-%m-%dT%H:%M:%SZ``), so a receipt that landed in BOTH
+    census sources within the same second counts ONCE (the union's purpose
+    — docker-log-only duplicates would double-count it). A line with no
+    parseable timestamp falls back to the full line as its identity, so
+    identical raw lines still dedup (the historical raw-line semantics).
+    """
+    ts_key = ts.replace(microsecond=0) if ts is not None else None
+    if ts_key is None:
+        return ("raw", line)
+    m = RECEIPT_HANDLE_RE.search(line)
+    if m is None:
+        return ("raw", line)
+    return (ts_key, m.group(1))
+
+
+def _union_receipt_census(docker_matched: list[str], sidecar_text: str,
+                          since_iso: str, until_iso: str) -> list[str]:
+    """R-A3: union the docker-log receipt census with the receipts sidecar,
+    windowed by [since, until] (the sidecar's ISO prefix is timestamp-parsed
+    with the same window semantics; docker lines are already windowed by the
+    docker logs --since/--until fetch), deduped on identical
+    (timestamp, handle) pairs. Order-preserving: docker lines first, then
+    new sidecar lines."""
+    since_dt = _parse_iso_utc(since_iso)
+    until_dt = _parse_iso_utc(until_iso)
+    seen: set[tuple] = set()
+    out: list[str] = []
+    for ln in docker_matched:
+        key = _receipt_pair_key(ln, _docker_log_timestamp(ln))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ln)
+    for raw in sidecar_text.splitlines():
+        ln = raw.strip()
+        m = SIDECAR_RECEIPT_RE.match(ln)
+        if m is None:
+            continue
+        ts = _parse_iso_utc(m.group(1))
+        if ts is None:
+            continue
+        if since_dt is not None and ts < since_dt:
+            continue
+        if until_dt is not None and ts > until_dt:
+            continue
+        key = _receipt_pair_key(ln, ts)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ln)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # L1 deltas (Balázs directive 2026-10-30 23:50 UTC): state-vs-claim
@@ -314,7 +559,8 @@ LEDGER_PIN_RE = re.compile(r'COMMAND_RETURN: \(\(pin "(LEDGER: [^"]*)"')
 
 
 def _census_ledger_pins(since_iso: str, until_iso: str,
-                        extra_logs: str = "") -> dict:
+                        extra_logs: str = "", profile: AgentProfile | None = None
+                        ) -> dict:
     """Collect the LEDGER lines the agent actually PINNED (emission lane,
     COMMAND_RETURN only), in order, bounded by [since, until].
 
@@ -329,7 +575,8 @@ def _census_ledger_pins(since_iso: str, until_iso: str,
     out: dict = {"pins": [], "window": [since_iso, until_iso]}
     logs = extra_logs
     try:
-        logs += _docker_logs_since(CONTAINER_AGENT, since_iso, until_iso)
+        logs += _docker_logs_since(
+            (profile or OMEGA_PROFILE).container_agent, since_iso, until_iso)
     except Exception as e:  # docker down / container gone: not gate evidence
         out["error"] = str(e)[:200]
     if extra_logs:
@@ -431,7 +678,9 @@ class StallWatchdog:
 
 
 def _census_persist_receipts(since_iso: str, until_iso: str,
-                             extra_logs: str = "") -> dict:
+                             extra_logs: str = "",
+                             profile: AgentProfile | None = None,
+                             memory_volume: str | None = None) -> dict:
     """Count STRICT v4 persist receipts in the AGENT container's docker
     logs bounded by [since, until] (v17 harness iteration 2,
     wr3o-20261028).
@@ -470,13 +719,21 @@ def _census_persist_receipts(since_iso: str, until_iso: str,
 
     Docker/log errors are NOT gate evidence: count 0 + ``error`` recorded
     (the gate then sees a zero census — conservative, same failure mode
-    as the lossy window it replaces)."""
+    as the lossy window it replaces).
+
+    R-A3 (openclaw profile): the docker-log census stays the PRIMARY
+    source (same regex, same LLMRequest exclusion) and is UNIONED with the
+    receipts sidecar (<memory-volume>/benchmark/persist-receipts.log, one
+    ISO-8601-prefixed receipt line per das-write success) — the sidecar
+    lines are timestamp-windowed with the same [since, until] semantics
+    and identical (timestamp, handle) pairs are deduped."""
+    prof = profile or OMEGA_PROFILE
     out = {"count": 0, "matched": [], "window": [since_iso, until_iso]}
     logs = extra_logs
     if extra_logs:
         out["extra_source"] = "phase1-docker.log"
     try:
-        logs += _docker_logs_since(CONTAINER_AGENT, since_iso, until_iso)
+        logs += _docker_logs_since(prof.container_agent, since_iso, until_iso)
     except Exception as e:  # docker down / container gone: not gate evidence
         out["error"] = str(e)[:200]
     # v2 two-phase: order-preserving de-dupe of raw log lines (timestamp
@@ -489,6 +746,19 @@ def _census_persist_receipts(since_iso: str, until_iso: str,
         if PERSIST_RECEIPT_RE.search(ln)
         and "LLMRequest[" not in ln))
     out["count"] = len(out["matched"])
+    if prof.uses_receipts_sidecar and memory_volume:
+        sidecar_path = Path(memory_volume) / RECEIPTS_SIDECAR_REL
+        sidecar_text = _sudo_read(sidecar_path) or ""
+        docker_count = out["count"]
+        out["matched"] = _union_receipt_census(
+            out["matched"], sidecar_text, since_iso, until_iso)
+        out["count"] = len(out["matched"])
+        out["sidecar"] = {
+            "path": str(sidecar_path),
+            "source": RECEIPTS_SIDECAR_REL,
+            "docker_matched": docker_count,
+            "union_count": out["count"],
+        }
     return out
 
 
@@ -540,7 +810,8 @@ def collect_attestation(args, case_id: str, since_iso: str, until_iso: str,
     been receipts-only since item 2 (BRIDGE-PERSIST-OK receipts extracted
     from the history window).
     """
-    agent_ip = _container_ip(CONTAINER_AGENT)
+    agent_ip = _container_ip(_profile(args).container_agent,
+                             _profile(args).container_agent)
     return {
         "case_id": case_id,
         "agent_ip": agent_ip,
@@ -658,21 +929,113 @@ def _standby_prompt_clean(args) -> str:
     the teardown contamination guard would abort only after the whole
     run window burned. Same "BENCHMARK MODE" marker teardown refuses
     to restore. Returns "ok" (standby) or "CONTAMINATED" (residue)."""
-    live = _sudo_read(Path(args.memory_volume) / "prompt.txt")
+    live = _sudo_read(Path(_memory_volume(args)) / "prompt.txt")
     if live is None:
         return "error: prompt.txt unreadable"
     return "ok" if "BENCHMARK MODE" not in live else "CONTAMINATED"
 
 
+def _preflight_openclaw_checks(args, profile: AgentProfile,
+                               checks: dict[str, str]) -> None:
+    """R-A5: openclaw-profile preflight assertions (live only, never
+    dry-run). Gateway container running on the client network with a
+    reachable IP, workspace volume present, benchmark/ artifact files
+    creatable, write-bridge + read-proxy reachable FROM the SUT container,
+    the six benchmark skills present, and the Omega agent container
+    ABSENT/STOPPED on the host (shared ASI1 key quota)."""
+    try:
+        r = _run(["docker", "network", "inspect", "omega-das-integration-client",
+                  "--format", "{{range .Containers}}{{.Name}} {{end}}"])
+        names = (r.stdout or "").split()
+        checks["gateway_on_das_network"] = (
+            "ok" if profile.container_agent in names else
+            f"missing: connect {profile.container_agent} to omega-das-integration-client")
+    except Exception as e:
+        checks["gateway_on_das_network"] = f"error: {e}"
+
+    try:
+        r = _run(["docker", "volume", "inspect", "openclaw-sut-workspace"])
+        checks["workspace_volume"] = "ok" if r.returncode == 0 else "missing"
+    except Exception as e:
+        checks["workspace_volume"] = f"error: {e}"
+
+    try:
+        r = _run(["docker", "exec", profile.container_agent, "sh", "-c",
+                  "mkdir -p /var/openclaw/workspace/benchmark && "
+                  "touch /var/openclaw/workspace/benchmark/.harness-write-test && "
+                  "rm -f /var/openclaw/workspace/benchmark/.harness-write-test"])
+        checks["benchmark_artifacts_creatable"] = (
+            "ok" if r.returncode == 0 else
+            f"failed rc={r.returncode}: {r.stderr.strip()[:160]}")
+    except Exception as e:
+        checks["benchmark_artifacts_creatable"] = f"error: {e}"
+
+    for lane, container in [("write_bridge", CONTAINER_WRITE_BRIDGE),
+                            ("read_proxy", CONTAINER_READ_PROXY)]:
+        ip = _container_ip(container)
+        try:
+            r = _run(["docker", "exec", profile.container_agent, "python3", "-c",
+                      "import socket,sys; "
+                      "socket.create_connection((sys.argv[1], 8080), timeout=5)",
+                      ip], timeout=30.0)
+            checks[f"{lane}_reachable_from_sut"] = (
+                "ok" if r.returncode == 0 and ip else
+                f"unreachable: {ip or 'no ip'}")
+        except Exception as e:
+            checks[f"{lane}_reachable_from_sut"] = f"error: {e}"
+
+    missing_skills: list[str] = []
+    for skill in ("das-write", "das-retrieve", "metta", "pin",
+                  "das-extract-knowledge", "das-grounded-reasoning"):
+        try:
+            r = _run(["docker", "exec", profile.container_agent, "test", "-d",
+                      f"/var/openclaw/workspace/skills/{skill}"])
+            if r.returncode != 0:
+                missing_skills.append(skill)
+        except Exception as e:
+            checks["sut_skills_present"] = f"error: {e}"
+            missing_skills = []
+            break
+    if missing_skills or "sut_skills_present" not in checks:
+        if missing_skills:
+            checks["sut_skills_present"] = f"missing: {','.join(missing_skills)}"
+        elif "sut_skills_present" not in checks:
+            checks["sut_skills_present"] = "ok"
+
+    # R-A5: the Omega agent container must be ABSENT/STOPPED — the ASI1 key
+    # quota is shared between both agents.
+    try:
+        r = _run(["docker", "ps", "--filter", "name=omega-curiosity",
+                  "--format", "{{.Names}}"])
+        running = (r.stdout or "").split()
+        checks["omega_agent_stopped"] = (
+            "ok" if not running else
+            "RUNNING — stop it first (shared ASI1 key quota): "
+            f"sudo systemctl stop omega-curiosity.service")
+    except Exception as e:
+        checks["omega_agent_stopped"] = f"error: {e}"
+
+
+_OPENCLAW_PREFLIGHT_KEYS = [
+    "gateway_on_das_network", "workspace_volume",
+    "benchmark_artifacts_creatable", "write_bridge_reachable_from_sut",
+    "read_proxy_reachable_from_sut", "sut_skills_present",
+    "omega_agent_stopped",
+]
+
+
 def preflight(args) -> int:
     """Preflight phase: verify environment is ready for the benchmark."""
+    profile = _profile(args)
     _resolve_endpoints(args)
-    print(f"[preflight] write_bridge={args.write_bridge} read_proxy={args.read_proxy}")
+    print(f"[preflight] profile={profile.name} "
+          f"write_bridge={args.write_bridge} read_proxy={args.read_proxy}")
 
     checks: dict[str, str] = {}
 
     for container in [CONTAINER_WRITE_BRIDGE, CONTAINER_READ_PROXY,
-                      CONTAINER_QUERY_ENGINE, CONTAINER_MONGODB, CONTAINER_AGENT]:
+                      CONTAINER_QUERY_ENGINE, CONTAINER_MONGODB,
+                      profile.container_agent]:
         if args.dry_run:
             checks[f"container_{container}"] = "dry-run"
         else:
@@ -685,8 +1048,14 @@ def preflight(args) -> int:
     ips = {}
     for name, container in [("write_bridge", CONTAINER_WRITE_BRIDGE),
                             ("read_proxy", CONTAINER_READ_PROXY),
-                            ("agent", CONTAINER_AGENT)]:
-        ips[name] = "dry-run" if args.dry_run else _container_ip(container)
+                            ("agent", profile.container_agent)]:
+        if args.dry_run:
+            ips[name] = "dry-run"
+        elif name == "agent" and profile is not OMEGA_PROFILE:
+            # non-omega agent: _pick_agent_ip needs the profile's own name
+            ips[name] = _container_ip(container, container)
+        else:
+            ips[name] = _container_ip(container)
         checks[f"{name}_ip"] = ips.get(name, "")
 
     if not args.dry_run:
@@ -711,13 +1080,13 @@ def preflight(args) -> int:
         checks["ledger_repo_format"] = _ledger_repo_format(args)
 
         try:
-            r = _sudo_run(["test", "-d", args.memory_volume])
+            r = _sudo_run(["test", "-d", _memory_volume(args)])
             checks["memory_volume"] = "ok" if r.returncode == 0 else "missing"
         except Exception as e:
             checks["memory_volume"] = f"error: {e}"
 
         # v3: the per-run prompt backup must not pre-exist (fresh run-id rule)
-        bp = Path(args.memory_volume) / f"prompt.txt.bak-pre-benchmark-{args.run_id}"
+        bp = Path(_memory_volume(args)) / f"prompt.txt.bak-pre-benchmark-{args.run_id}"
         checks["prompt_backup_fresh"] = "ok" if not _sudo_run(["test", "-f", str(bp)]).returncode == 0 else "EXISTS"
 
         # v5 (sks2-smoke4 lesson, 2026-11-02): killed-run residue guard.
@@ -730,85 +1099,91 @@ def preflight(args) -> int:
         # restore). Infra check, not a gate change.
         checks["standby_prompt_clean"] = _standby_prompt_clean(args)
 
-        # v3: skill-description upgrade deployed? (das-retrieve description
-        # in the mounted plugin must carry the WHY/WHEN/HOW contract)
-        try:
-            plugin_path = "/home/ubuntu/low-cost-omega-setup/deploy/omega/plugins/das-read/das-read.metta"
-            r = _run(["grep", "-c", "WHY: DAS is your persistent knowledge store", plugin_path])
-            checks["skill_description_upgraded"] = "ok" if r.returncode == 0 and r.stdout.strip() != "0" else "MISSING"
-        except Exception as e:
-            checks["skill_description_upgraded"] = f"error: {e}"
+        if profile is OMEGA_PROFILE:
+            # v3: skill-description upgrade deployed? (das-retrieve description
+            # in the mounted plugin must carry the WHY/WHEN/HOW contract)
+            try:
+                plugin_path = "/home/ubuntu/low-cost-omega-setup/deploy/omega/plugins/das-read/das-read.metta"
+                r = _run(["grep", "-c", "WHY: DAS is your persistent knowledge store", plugin_path])
+                checks["skill_description_upgraded"] = "ok" if r.returncode == 0 and r.stdout.strip() != "0" else "MISSING"
+            except Exception as e:
+                checks["skill_description_upgraded"] = f"error: {e}"
 
-        # v17 item 7 (c): das-write v3 grammar deployed? (the receipt
-        # form the prompt teaches and the E/H gates parse — see
-        # _das_write_grammar_v3)
-        checks["das_write_grammar_v3"] = _das_write_grammar_v3()
+            # v17 item 7 (c): das-write v3 grammar deployed? (the receipt
+            # form the prompt teaches and the E/H gates parse — see
+            # _das_write_grammar_v3)
+            checks["das_write_grammar_v3"] = _das_write_grammar_v3()
 
-        # v6: metta-grammar plugin deployed? (scenario-A/A2 lesson,
-        # 2026-10-25: NAL/PLN operators are STRICTLY 2-ARGUMENT and the
-        # atomspace is ephemeral between calls — the stock metta skill
-        # description documents none of it, and the agent burned ~321
-        # calls on never-matching 3+-arg forms. Two checks: the repo
-        # artifact carries the contract, AND the running agent container
-        # actually has the plugin mounted — the 10:04Z A2 launch failed
-        # exactly because the live start.sh lacked the mount while the
-        # repo file was fine (systemd unit runs /home/ubuntu/omega-
-        # curiosity/start.sh, not the repo copy).
-        try:
-            plugin_path = "/home/ubuntu/low-cost-omega-setup/deploy/omega/plugins/metta-grammar/metta-grammar.metta"
-            r = _run(["grep", "-c", "STRICTLY 2-ARGUMENT", plugin_path])
-            checks["metta_skill_upgraded"] = "ok" if r.returncode == 0 and r.stdout.strip() != "0" else "MISSING"
-        except Exception as e:
-            checks["metta_skill_upgraded"] = f"error: {e}"
-        try:
-            r = _run(["docker", "exec", CONTAINER_AGENT, "test", "-f",
-                      "/PeTTa/repos/Omega/plugins/metta-grammar/metta-grammar.metta"])
-            checks["metta_plugin_mounted"] = "ok" if r.returncode == 0 else "missing"
-        except Exception as e:
-            checks["metta_plugin_mounted"] = f"error: {e}"
+            # v6: metta-grammar plugin deployed? (scenario-A/A2 lesson,
+            # 2026-10-25: NAL/PLN operators are STRICTLY 2-ARGUMENT and the
+            # atomspace is ephemeral between calls — the stock metta skill
+            # description documents none of it, and the agent burned ~321
+            # calls on never-matching 3+-arg forms. Two checks: the repo
+            # artifact carries the contract, AND the running agent container
+            # actually has the plugin mounted — the 10:04Z A2 launch failed
+            # exactly because the live start.sh lacked the mount while the
+            # repo file was fine (systemd unit runs /home/ubuntu/omega-
+            # curiosity/start.sh, not the repo copy).
+            try:
+                plugin_path = "/home/ubuntu/low-cost-omega-setup/deploy/omega/plugins/metta-grammar/metta-grammar.metta"
+                r = _run(["grep", "-c", "STRICTLY 2-ARGUMENT", plugin_path])
+                checks["metta_skill_upgraded"] = "ok" if r.returncode == 0 and r.stdout.strip() != "0" else "MISSING"
+            except Exception as e:
+                checks["metta_skill_upgraded"] = f"error: {e}"
+            try:
+                r = _run(["docker", "exec", profile.container_agent, "test", "-f",
+                          "/PeTTa/repos/Omega/plugins/metta-grammar/metta-grammar.metta"])
+                checks["metta_plugin_mounted"] = "ok" if r.returncode == 0 else "missing"
+            except Exception as e:
+                checks["metta_plugin_mounted"] = f"error: {e}"
 
-        # v-split (2026-11-01, skill-split directive): the two new plugin
-        # skills (das-extract-knowledge + das-grounded-reasoning) must be
-        # mounted in the running agent container AND their skill
-        # descriptions must carry the required contract markers — the
-        # same check pattern as metta_plugin_mounted (live container file
-        # exists). The repo artifact check (grep for the description
-        # anchors) guards the mounted copy.
-        try:
-            r = _run(["docker", "exec", CONTAINER_AGENT, "test", "-f",
-                      "/PeTTa/repos/Omega/plugins/das-extract-knowledge/das-extract-knowledge.metta"])
-            checks["das_extract_knowledge_plugin_mounted"] = "ok" if r.returncode == 0 else "missing"
-        except Exception as e:
-            checks["das_extract_knowledge_plugin_mounted"] = f"error: {e}"
-        try:
-            plugin_path = "/home/ubuntu/low-cost-omega-setup/deploy/omega/plugins/das-extract-knowledge/das-extract-knowledge.metta"
-            r = _run(["grep", "-c", "das-extract-knowledge", plugin_path])
-            checks["das_extract_knowledge_skill_description"] = "ok" if r.returncode == 0 and r.stdout.strip() != "0" else "MISSING"
-        except Exception as e:
-            checks["das_extract_knowledge_skill_description"] = f"error: {e}"
-        try:
-            r = _run(["docker", "exec", CONTAINER_AGENT, "test", "-f",
-                      "/PeTTa/repos/Omega/plugins/das-grounded-reasoning/das-grounded-reasoning.metta"])
-            checks["das_grounded_reasoning_plugin_mounted"] = "ok" if r.returncode == 0 else "missing"
-        except Exception as e:
-            checks["das_grounded_reasoning_plugin_mounted"] = f"error: {e}"
-        try:
-            plugin_path = "/home/ubuntu/low-cost-omega-setup/deploy/omega/plugins/das-grounded-reasoning/das-grounded-reasoning.metta"
-            r = _run(["grep", "-c", "das-grounded-reasoning", plugin_path])
-            checks["das_grounded_reasoning_skill_description"] = "ok" if r.returncode == 0 and r.stdout.strip() != "0" else "MISSING"
-        except Exception as e:
-            checks["das_grounded_reasoning_skill_description"] = f"error: {e}"
+            # v-split (2026-11-01, skill-split directive): the two new plugin
+            # skills (das-extract-knowledge + das-grounded-reasoning) must be
+            # mounted in the running agent container AND their skill
+            # descriptions must carry the required contract markers — the
+            # same check pattern as metta_plugin_mounted (live container file
+            # exists). The repo artifact check (grep for the description
+            # anchors) guards the mounted copy.
+            try:
+                r = _run(["docker", "exec", profile.container_agent, "test", "-f",
+                          "/PeTTa/repos/Omega/plugins/das-extract-knowledge/das-extract-knowledge.metta"])
+                checks["das_extract_knowledge_plugin_mounted"] = "ok" if r.returncode == 0 else "missing"
+            except Exception as e:
+                checks["das_extract_knowledge_plugin_mounted"] = f"error: {e}"
+            try:
+                plugin_path = "/home/ubuntu/low-cost-omega-setup/deploy/omega/plugins/das-extract-knowledge/das-extract-knowledge.metta"
+                r = _run(["grep", "-c", "das-extract-knowledge", plugin_path])
+                checks["das_extract_knowledge_skill_description"] = "ok" if r.returncode == 0 and r.stdout.strip() != "0" else "MISSING"
+            except Exception as e:
+                checks["das_extract_knowledge_skill_description"] = f"error: {e}"
+            try:
+                r = _run(["docker", "exec", profile.container_agent, "test", "-f",
+                          "/PeTTa/repos/Omega/plugins/das-grounded-reasoning/das-grounded-reasoning.metta"])
+                checks["das_grounded_reasoning_plugin_mounted"] = "ok" if r.returncode == 0 else "missing"
+            except Exception as e:
+                checks["das_grounded_reasoning_plugin_mounted"] = f"error: {e}"
+            try:
+                plugin_path = "/home/ubuntu/low-cost-omega-setup/deploy/omega/plugins/das-grounded-reasoning/das-grounded-reasoning.metta"
+                r = _run(["grep", "-c", "das-grounded-reasoning", plugin_path])
+                checks["das_grounded_reasoning_skill_description"] = "ok" if r.returncode == 0 and r.stdout.strip() != "0" else "MISSING"
+            except Exception as e:
+                checks["das_grounded_reasoning_skill_description"] = f"error: {e}"
 
-        # v3: Omega's native embedding memory (remember/query skills) needs
-        # the chroma_db target dir to exist in the volume; the image's
-        # /PeTTa/chroma_db symlink dangles otherwise and EVERY boot logs
-        # Knowledge init failed (live evidence wr3-20261023).
-        try:
-            chroma_dir = Path(args.memory_volume) / "chroma_db"
-            r = _sudo_run(["test", "-d", str(chroma_dir)])
-            checks["chroma_memory_dir"] = "ok" if r.returncode == 0 else "missing (create: sudo mkdir -p <vol>/chroma_db && sudo chown 65534:65534 <vol>/chroma_db)"
-        except Exception as e:
-            checks["chroma_memory_dir"] = f"error: {e}"
+            # v3: Omega's native embedding memory (remember/query skills) needs
+            # the chroma_db target dir to exist in the volume; the image's
+            # /PeTTa/chroma_db symlink dangles otherwise and EVERY boot logs
+            # Knowledge init failed (live evidence wr3-20261023).
+            try:
+                chroma_dir = Path(_memory_volume(args)) / "chroma_db"
+                r = _sudo_run(["test", "-d", str(chroma_dir)])
+                checks["chroma_memory_dir"] = "ok" if r.returncode == 0 else "missing (create: sudo mkdir -p <vol>/chroma_db && sudo chown 65534:65534 <vol>/chroma_db)"
+            except Exception as e:
+                checks["chroma_memory_dir"] = f"error: {e}"
+        else:
+            # openclaw profile: the R-A5 assertions replace the omega
+            # plugin/chroma checks (the SUT has no Omega plugins and no
+            # chroma memory).
+            _preflight_openclaw_checks(args, profile, checks)
 
         # v3: canary fact must resolve BEFORE the run (campaign atoms intact)
         try:
@@ -836,14 +1211,18 @@ def preflight(args) -> int:
         checks["memory_volume"] = "dry-run"
         checks["prompt_backup_fresh"] = "dry-run"
         checks["standby_prompt_clean"] = "dry-run"
-        checks["skill_description_upgraded"] = "dry-run"
-        checks["das_write_grammar_v3"] = "dry-run"
-        checks["metta_skill_upgraded"] = "dry-run"
-        checks["metta_plugin_mounted"] = "dry-run"
-        checks["das_extract_knowledge_plugin_mounted"] = "dry-run"
-        checks["das_extract_knowledge_skill_description"] = "dry-run"
-        checks["das_grounded_reasoning_plugin_mounted"] = "dry-run"
-        checks["das_grounded_reasoning_skill_description"] = "dry-run"
+        if profile is OMEGA_PROFILE:
+            checks["skill_description_upgraded"] = "dry-run"
+            checks["das_write_grammar_v3"] = "dry-run"
+            checks["metta_skill_upgraded"] = "dry-run"
+            checks["metta_plugin_mounted"] = "dry-run"
+            checks["das_extract_knowledge_plugin_mounted"] = "dry-run"
+            checks["das_extract_knowledge_skill_description"] = "dry-run"
+            checks["das_grounded_reasoning_plugin_mounted"] = "dry-run"
+            checks["das_grounded_reasoning_skill_description"] = "dry-run"
+        else:
+            for key in _OPENCLAW_PREFLIGHT_KEYS:
+                checks[key] = "dry-run"
         checks["canary_fetch_ai"] = "dry-run"
         checks["judge_smoke"] = "dry-run"
 
@@ -1270,46 +1649,198 @@ def _render_prompts_txt(here: Path) -> str:
     return "\n".join(lines)
 
 
+def _apply_profile_prompt_paths(text: str, profile: AgentProfile) -> str:
+    """Map the frozen prompt templates' hard-coded omega memory-volume paths
+    onto the active profile's paths. IDENTITY for the omega profile (the
+    rendered prompt stays byte-for-byte as today); the frozen template
+    FILES themselves are never modified. The openclaw profile's workspace is
+    its own root, so the background-file and checkpoint-manifest references
+    resolve against /var/openclaw/workspace instead of the Omega mount.
+
+    Deliberately NOT remapped: the templates' ``omega_state.md`` mention —
+    for the openclaw profile prompt.txt IS the state file, and pointing the
+    agent at it would let a mid-case write corrupt future re-issued
+    deliveries; the agent may create a vestigial omega_state.md instead
+    (benign: nothing in the openclaw census reads it)."""
+    return (text
+            .replace("repos/Omega/memory/benchmark",
+                     profile.bench_prompt_rel)
+            .replace("/PeTTa/repos/Omega/memory",
+                     profile.workspace_abs_in_container))
+
+
 def _render_case_prompt(args, case: dict) -> str:
-    """Render agent_prompt_template.md for ONE standalone case question."""
-    paths = _bench_paths(args)
+    """Render agent_prompt_template.md for ONE standalone question."""
+    profile = _profile(args)
     template = (HERE / "agent_prompt_template.md").read_text(encoding="utf-8")
-    return (template
+    return _apply_profile_prompt_paths((template
             .replace("{{RUN_ID}}", args.run_id)
             .replace("{{CASE_ID}}", case["id"])
             .replace("{{QUESTION}}", case["question"])
-            .replace("{{URL_LIST_PATH}}", URLS_PROMPT_REL)
-            .replace("{{ANSWERS_PATH}}", ANSWERS_PROMPT_REL)
-            .replace("{{FACTS_INDEX_PATH}}", FACTS_INDEX_PROMPT_REL))
+            .replace("{{URL_LIST_PATH}}", profile.urls_prompt_rel)
+            .replace("{{ANSWERS_PATH}}", profile.answers_prompt_rel)
+            .replace("{{FACTS_INDEX_PATH}}", profile.facts_index_prompt_rel)),
+            profile)
 
 
 def _render_extraction_prompt(args, case: dict) -> str:
     """Render agent_extraction_prompt_template.md for ONE case (v2 two-phase)."""
+    profile = _profile(args)
     template = (HERE / "agent_extraction_prompt_template.md").read_text(encoding="utf-8")
-    return (template
+    return _apply_profile_prompt_paths((template
             .replace("{{RUN_ID}}", args.run_id)
             .replace("{{CASE_ID}}", case["id"])
             .replace("{{QUESTION}}", case["question"])
-            .replace("{{URL_LIST_PATH}}", URLS_PROMPT_REL)
-            .replace("{{ANSWERS_PATH}}", ANSWERS_PROMPT_REL)
-            .replace("{{FACTS_INDEX_PATH}}", FACTS_INDEX_PROMPT_REL))
+            .replace("{{URL_LIST_PATH}}", profile.urls_prompt_rel)
+            .replace("{{ANSWERS_PATH}}", profile.answers_prompt_rel)
+            .replace("{{FACTS_INDEX_PATH}}", profile.facts_index_prompt_rel)),
+            profile)
 
 
 def _render_reasoning_prompt(args, case: dict) -> str:
     """Render agent_reasoning_prompt_template.md for ONE case (v2 two-phase)."""
+    profile = _profile(args)
     template = (HERE / "agent_reasoning_prompt_template.md").read_text(encoding="utf-8")
-    return (template
+    return _apply_profile_prompt_paths((template
             .replace("{{RUN_ID}}", args.run_id)
             .replace("{{CASE_ID}}", case["id"])
             .replace("{{QUESTION}}", case["question"])
-            .replace("{{URL_LIST_PATH}}", URLS_PROMPT_REL)
-            .replace("{{ANSWERS_PATH}}", ANSWERS_PROMPT_REL)
-            .replace("{{FACTS_INDEX_PATH}}", FACTS_INDEX_PROMPT_REL))
+            .replace("{{URL_LIST_PATH}}", profile.urls_prompt_rel)
+            .replace("{{ANSWERS_PATH}}", profile.answers_prompt_rel)
+            .replace("{{FACTS_INDEX_PATH}}", profile.facts_index_prompt_rel)),
+            profile)
 
 
-def _agent_restart() -> bool:
-    r = _sudo_run(["systemctl", "restart", "omega-curiosity.service"], timeout=180.0)
+def _agent_restart(profile: AgentProfile | None = None) -> bool:
+    """Restart the agent under test via its profile's systemd unit (omega:
+    ``sudo systemctl restart omega-curiosity.service`` — byte-for-byte
+    today's behavior). ``profile=None`` keeps the historical zero-arg call
+    (and its test stubs) on the omega restart command."""
+    cmd = (profile or OMEGA_PROFILE).restart_cmd
+    r = _sudo_run(cmd, timeout=180.0)
     return r.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# R-A2 prompt delivery (openclaw profile): the harness writes the rendered
+# prompt.txt into the memory volume exactly as today AND then starts a real
+# agent turn inside the SUT gateway container:
+#   docker exec <container_agent> openclaw agent --message-file <abs-in-container
+#   prompt.txt path> --session-id wr-<run_id>-<case_id> --no-color
+# (flags verified against the pinned image's documented CLI surface:
+# openclaw agent --message-file / --session-id exist; --no-color is a global
+# CLI flag — docs.openclaw.ai/cli/agent, /cli). The turn is non-blocking and
+# bounded: the wait loops (agent_case / the phase-1 manifest poll) manage it
+# under the EXISTING stall/phase-timeout machinery — re-issue on nonzero
+# exit or on a stall-window without the answer block, at most one re-issue
+# per stall window, the case/phase wall-clock cap bounds the total. No new
+# policy: the frozen prompt is idempotent for wake cycles by design.
+# ---------------------------------------------------------------------------
+
+_DELIVERY_PROCS: dict[tuple[str, str], dict] = {}
+
+
+def _delivery_command(args, case_id: str) -> list[str]:
+    """R-A2: the agent-turn delivery command as ONE testable unit (exact
+    argv, session-id format wr-<run_id>-<case_id>). Empty for the omega
+    profile (restart-only delivery — the prompt is read at agent start)."""
+    profile = _profile(args)
+    if profile.prompt_abs_in_container is None:
+        return []
+    return [
+        "docker", "exec", profile.container_agent,
+        "openclaw", "agent",
+        "--message-file", profile.prompt_abs_in_container,
+        "--session-id", f"wr-{args.run_id}-{case_id}",
+        "--no-color",
+    ]
+
+
+def _start_agent_turn(args, case_id: str) -> bool:
+    """Start the delivery turn (non-blocking Popen, output discarded — the
+    gateway container's own logs carry the turn transcript; the receipts
+    sidecar covers census robustness)."""
+    profile = _profile(args)
+    if not profile.delivers_agent_turn:
+        return True
+    cmd = _delivery_command(args, case_id)
+    if getattr(args, "dry_run", False):
+        print(f"[delivery] [dry-run] would start the agent turn: "
+              f"{shlex.join(cmd)}")
+        return True
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    except OSError as e:
+        print(f"[delivery] ERROR: could not start the agent turn "
+              f"(case {case_id}): {e}")
+        return False
+    key = (args.run_id, case_id)
+    prior = _DELIVERY_PROCS.get(key)
+    _DELIVERY_PROCS[key] = {
+        "proc": proc, "argv": cmd,
+        "issues": (prior["issues"] + 1) if prior else 1,
+        "last_reissue": (prior or {}).get("last_reissue", 0.0),
+    }
+    print(f"[delivery] agent turn started (session wr-{args.run_id}-{case_id})")
+    return True
+
+
+def _reissue_agent_turn(args, case_id: str) -> bool:
+    """Re-issue the same delivery (idempotent prompt): kill a still-running
+    turn first — a hung turn plus a fresh one would double-answer."""
+    key = (args.run_id, case_id)
+    rec = _DELIVERY_PROCS.get(key)
+    if rec is not None and rec["proc"].poll() is None:
+        try:
+            rec["proc"].kill()
+        except OSError:
+            pass
+    return _start_agent_turn(args, case_id)
+
+
+def _maybe_reissue_delivery(args, case_id: str, stall_seconds: float,
+                            reason: str) -> bool:
+    """The R-A2 re-issue gate shared by both wait loops: at most ONE
+    re-issue per stall window (the existing watchdog cadence); the case /
+    phase wall-clock cap — also existing machinery — bounds the total.
+    Returns True when a re-issue was started."""
+    profile = _profile(args)
+    if not profile.delivers_agent_turn or getattr(args, "dry_run", False):
+        return False
+    key = (args.run_id, case_id)
+    rec = _DELIVERY_PROCS.get(key)
+    now = time.time()
+    if (rec is not None and stall_seconds > 0
+            and now - rec.get("last_reissue", 0.0) < stall_seconds):
+        return False  # this stall window already re-issued
+    ok = _reissue_agent_turn(args, case_id)
+    if ok and key in _DELIVERY_PROCS:
+        _DELIVERY_PROCS[key]["last_reissue"] = now
+    if ok:
+        print(f"[delivery] re-issued the agent turn ({reason})")
+    return ok
+
+
+def _delivery_exit(args, case_id: str) -> int | None:
+    """The delivery turn's exit code, None while still running (or absent)."""
+    rec = _DELIVERY_PROCS.get((args.run_id, case_id))
+    if rec is None:
+        return None
+    return rec["proc"].poll()
+
+
+def _stop_agent_turn(args, case_id: str) -> None:
+    """Best-effort stop of the delivery turn (case complete or timed out —
+    a lingering duplicate turn must not keep consuming the shared quota)."""
+    rec = _DELIVERY_PROCS.pop((args.run_id, case_id), None)
+    if rec is None:
+        return
+    if rec["proc"].poll() is None:
+        try:
+            rec["proc"].kill()
+        except OSError:
+            pass
 
 
 def _prepare_benchmark_dir(args) -> None:
@@ -1333,7 +1864,12 @@ def setup_case(args, phase: str = None) -> int:
     When ``phase`` is given ("extraction" or "reasoning"), render the
     v2 two-phase phase-specific template for that phase; otherwise render
     the single (fat) template (v1 compatibility).
+
+    openclaw profile (R-A2): after the prompt write + restart, a real
+    agent turn is started inside the SUT gateway container (see
+    _delivery_command); the frozen prompt is delivered per phase.
     """
+    profile = _profile(args)
     case = _case_by_id(args.case)
     if case is None:
         print(f"[setup-case] ERROR: unknown case id {args.case}")
@@ -1342,12 +1878,16 @@ def setup_case(args, phase: str = None) -> int:
     facts_mod = _facts_mod()
 
     if args.dry_run:
-        print(f"[setup-case] [dry-run] case {args.case}: prepare benchmark dir, "
-              "backup prompt/state/history (run start), snapshot history, "
-              "install rendered case prompt, "
-              + ("trim history to the per-case window marker"
-                 if getattr(args, "trim_history", True) else "keep full history")
-              + ", restart agent")
+        plan = (f"[setup-case] [dry-run] case {args.case}: prepare benchmark dir, "
+                "backup prompt/state/history (run start), snapshot history, "
+                "install rendered case prompt, "
+                + ("trim history to the per-case window marker"
+                   if getattr(args, "trim_history", True) else "keep full history")
+                + ", restart agent")
+        if profile.delivers_agent_turn:
+            plan += (f", then start the agent turn: "
+                     f"{shlex.join(_delivery_command(args, args.case))}")
+        print(plan)
         return 0
 
     first = args.case == facts_mod.TEST_CASES[0]["id"]
@@ -1366,8 +1906,12 @@ def setup_case(args, phase: str = None) -> int:
     if _sudo_run(["test", "-f", str(backup_prompt)]).returncode != 0:
         _sudo_run(["cp", str(paths["prompt"]),
                    str(backup_prompt)])
+        # state backup: omega → omega_state.md.bak-…; openclaw → the state
+        # file IS prompt.txt, so this is the same standby backup (the
+        # profile-routed name makes the parity explicit and keeps teardown
+        # symmetric)
         _sudo_run(["cp", str(paths["state"]),
-                   str(paths["vol"] / f"omega_state.md.bak-pre-benchmark-{args.run_id}")])
+                   str(paths["vol"] / f"{profile.state_file}.bak-pre-benchmark-{args.run_id}")])
         # v4 (lever 3): one-time backup of the FULL pre-run history so
         # teardown can restore the agent's memory byte-identically after
         # the per-case trims (the trim modifies the agent-owned history
@@ -1379,8 +1923,16 @@ def setup_case(args, phase: str = None) -> int:
             if not _sudo_run(["cp", str(paths["history"]), str(hist_bak)]).returncode == 0:
                 print("[setup-case] ERROR: history backup failed — refusing to trim")
                 return GATE_ERROR
-        # benchmark dir must be writable by the agent (nobody:nogroup)
-        _sudo_run(["chown", "-R", "65534:65534", str(paths["bench"])])
+        # benchmark dir must be writable by the agent (omega: nobody:nogroup;
+        # openclaw: the container's node user)
+        _sudo_run(["chown", "-R", profile.bench_owner, str(paths["bench"])])
+    elif profile is not OMEGA_PROFILE:
+        # openclaw: the harness re-writes root-owned files every case
+        # (history trim, prompt); keep the agent-writable ownership fresh
+        # (the node container user must be able to append).
+        _sudo_run(["chown", "-R", profile.bench_owner, str(paths["bench"])])
+        _sudo_run(["chown", profile.bench_owner, str(paths["prompt"]),
+                   str(paths["history"])])
 
     if first and (not phase or phase == "extraction"):
         # fresh answers.md + facts-index.md at run start (a run that
@@ -1443,13 +1995,32 @@ def setup_case(args, phase: str = None) -> int:
     if not _sudo_write(paths["prompt"], rendered):
         print(f"[setup-case] ERROR: could not write prompt for case {args.case}")
         return GATE_ERROR
-    if not _sudo_write(paths["state"],
-                       f"BENCHMARK MODE ACTIVE — run {args.run_id}, case {args.case}\n"):
-        print(f"[setup-case] ERROR: could not write omega_state.md")
+    # state write: omega keeps its dedicated omega_state.md marker; openclaw
+    # has no separate state file — prompt.txt IS the state (the rendered
+    # template carries the BENCHMARK MODE marker itself), so a second write
+    # would clobber the delivered prompt
+    if paths["state"] != paths["prompt"]:
+        if not _sudo_write(paths["state"],
+                           f"BENCHMARK MODE ACTIVE — run {args.run_id}, case {args.case}\n"):
+            print(f"[setup-case] ERROR: could not write {paths['state'].name}")
+            return GATE_ERROR
+
+    # profile-routed restart (omega keeps the historical zero-arg call —
+    # its test stubs depend on it)
+    if profile is OMEGA_PROFILE:
+        restart_ok = _agent_restart()
+    else:
+        restart_ok = _agent_restart(profile)
+    if not restart_ok:
+        print(f"[setup-case] ERROR: agent restart failed (case {args.case})")
         return GATE_ERROR
 
-    if not _agent_restart():
-        print(f"[setup-case] ERROR: agent restart failed (case {args.case})")
+    # R-A2 (openclaw): the prompt file is in place and the (fresh) gateway
+    # container is up — deliver the real agent turn (non-blocking; the wait
+    # loops manage it under the existing stall/timeout machinery)
+    if profile.delivers_agent_turn and not _start_agent_turn(args, args.case):
+        print(f"[setup-case] ERROR: agent-turn delivery failed to start "
+              f"(case {args.case})")
         return GATE_ERROR
 
     setup_record = {
@@ -1457,6 +2028,8 @@ def setup_case(args, phase: str = None) -> int:
         "window_start_snapshot": str(snap), "restarted_at": _now_iso(),
         "history_trimmed": trimmed,
         "stale_manifests_archived": stale_manifests,
+        "agent_profile": profile.name,
+        "prompt_delivery": profile.prompt_delivery,
     }
     if phase in ("extraction", "reasoning"):
         # phase-specific records: setup-extraction-case-<case>.json (the
@@ -1499,8 +2072,8 @@ PHASE1_LOG_BASENAME = "phase1-docker.log"
 
 
 def _checkpoint_dir(args) -> Path:
-    """The knowledge-checkpoints dir inside the Omega memory volume."""
-    return Path(args.memory_volume) / CHECKPOINT_DIR_REL
+    """The knowledge-checkpoints dir inside the agent memory volume."""
+    return Path(_memory_volume(args)) / CHECKPOINT_DIR_REL
 
 
 def _manifest_census(args) -> list[dict]:
@@ -1601,9 +2174,18 @@ def _poll_checkpoint_manifest(args, since_iso: str,
     stall_s = float(stall_minutes or 0) * 60
     paths = _bench_paths(args) if stall_s > 0 else None
     facts_state = (_sudo_read(paths["facts_index"]) or "") if paths else None
+    profile = _profile(args)
     last_signal = time.time()
     stall_aborted = False
     while time.time() - start < timeout_s:
+        if profile.delivers_agent_turn:
+            # R-A2 re-issue trigger: a delivery turn that exited nonzero
+            # re-issues (rate-limited by the stall window below)
+            delivery_rc = _delivery_exit(args, args.case)
+            if delivery_rc is not None and delivery_rc != 0:
+                _maybe_reissue_delivery(
+                    args, args.case, stall_s,
+                    f"delivery turn exited {delivery_rc}")
         for m in _manifest_census(args):
             if m["mtime"] >= since_epoch and m["name"] not in found:
                 found.append(m["name"])
@@ -1623,7 +2205,7 @@ def _poll_checkpoint_manifest(args, since_iso: str,
             else:
                 try:
                     recent = _docker_logs_since(
-                        CONTAINER_AGENT,
+                        profile.container_agent,
                         _now_iso_minus_seconds(max(120.0, interval_s * 4)),
                         _now_iso())
                     if PERSIST_RECEIPT_RE.search(recent):
@@ -1631,8 +2213,17 @@ def _poll_checkpoint_manifest(args, since_iso: str,
                 except Exception:
                     pass  # docker-log errors are not gate evidence
             if time.time() - last_signal >= stall_s:
-                stall_aborted = True
-                break
+                # R-A2 (openclaw): a phase-1 stall re-issues the delivery
+                # turn (the frozen prompt is idempotent) and keeps polling;
+                # the PHASE TIMEOUT stays the bound and the abort/grade-
+                # as-is semantics are unchanged for a stall that persists
+                # past it. omega keeps the existing early-abort.
+                if _maybe_reissue_delivery(args, args.case, stall_s,
+                                           "phase-1 stall"):
+                    last_signal = time.time()
+                else:
+                    stall_aborted = True
+                    break
         _sleep(interval_s)
     elapsed = int(time.time() - start)
     if stall_aborted:
@@ -1663,7 +2254,8 @@ def _snapshot_phase1_logs(args, since_iso: str) -> dict:
     rd.mkdir(parents=True, exist_ok=True)
     out_path = rd / PHASE1_LOG_BASENAME
     try:
-        logs = _docker_logs_since(CONTAINER_AGENT, since_iso, _now_iso())
+        logs = _docker_logs_since(
+            _profile(args).container_agent, since_iso, _now_iso())
         out_path.write_text(logs, encoding="utf-8")
         print(f"[snapshot-phase1] {out_path} ({len(logs)} bytes, "
               f"since {since_iso})")
@@ -1713,7 +2305,7 @@ def snapshot_phase1_logs(args) -> int:
     """v2: snapshot the phase-1 container logs before the phase-2 restart."""
     if args.dry_run:
         print(f"[snapshot-phase1] [dry-run] would snapshot "
-              f"{CONTAINER_AGENT} docker logs into results/{args.run_id}/"
+              f"{_profile(args).container_agent} docker logs into results/{args.run_id}/"
               f"windows/{args.case}/{PHASE1_LOG_BASENAME}")
         return 0
     rd = RESULTS_DIR / args.run_id
@@ -1727,6 +2319,7 @@ def snapshot_phase1_logs(args) -> int:
 
 def agent_case(args) -> int:
     """Wait for THIS case's FINAL ANSWER line in answers.md."""
+    profile = _profile(args)
     case = _case_by_id(args.case)
     if case is None:
         return GATE_ERROR
@@ -1738,6 +2331,10 @@ def agent_case(args) -> int:
 
     if args.dry_run:
         print(f"[agent-case] [dry-run] would poll answers.md for the marker")
+        if profile.delivers_agent_turn:
+            print(f"[agent-case] [dry-run] would manage the delivery turn "
+                  f"(re-issue on nonzero exit or stall): "
+                  f"{shlex.join(_delivery_command(args, args.case))}")
         return 0
 
     stall_minutes = getattr(args, "stall_minutes", DEFAULT_STALL_MINUTES)
@@ -1750,6 +2347,9 @@ def agent_case(args) -> int:
             # post snapshot bounds this case's window
             post = paths["vol"] / f"history.post-case-{args.run_id}-{args.case}.metta"
             _sudo_run(["cp", str(paths["history"]), str(post)])
+            # R-A2: the answer block exists — stop any lingering duplicate
+            # delivery turn (it must not keep consuming the shared quota)
+            _stop_agent_turn(args, args.case)
             elapsed = int(time.time() - start)
             print(f"[agent-case] case {args.case} answered after {elapsed}s")
             _write_json(RESULTS_DIR / args.run_id / f"agent-case-{args.case}.json", {
@@ -1757,6 +2357,15 @@ def agent_case(args) -> int:
                 "post_snapshot": str(post),
             })
             return 0
+        # R-A2 re-issue trigger (openclaw): a delivery turn that exited
+        # nonzero without the answer block re-issues (rate-limited by the
+        # stall window — the existing machinery)
+        if profile.delivers_agent_turn:
+            delivery_rc = _delivery_exit(args, args.case)
+            if delivery_rc is not None and delivery_rc != 0:
+                _maybe_reissue_delivery(
+                    args, args.case, stall_minutes * 60,
+                    f"delivery turn exited {delivery_rc}")
         # delta 3 (Balázs directive 22:54 UTC): a healthy case moves in
         # ~10-15 min; a long silent stretch is a stall to investigate
         # early, not wait out. Forward signals: new answers.md content,
@@ -1770,7 +2379,7 @@ def agent_case(args) -> int:
             facts_state = facts_now
             moved = True
         try:
-            recent = _docker_logs_since(CONTAINER_AGENT,
+            recent = _docker_logs_since(profile.container_agent,
                                         _now_iso_minus_seconds(120),
                                         _now_iso())
             if PERSIST_RECEIPT_RE.search(recent):
@@ -1780,9 +2389,21 @@ def agent_case(args) -> int:
         watchdog.register(moved, time.time())
         if watchdog.should_abort(time.time()):
             elapsed = int(time.time() - start)
+            if profile.delivers_agent_turn:
+                # R-A2: the answer block is still absent at the stall
+                # watchdog — re-issue the same delivery (the frozen prompt
+                # is idempotent for wake cycles by design); the case
+                # wall-clock cap (existing machinery) stays the backstop.
+                if _maybe_reissue_delivery(
+                        args, args.case, stall_minutes * 60,
+                        f"stall: no forward signal for {stall_minutes}m"):
+                    watchdog.register(True, time.time())
+                    time.sleep(30)
+                    continue
             print(f"[agent-case] STALL WATCHDOG: case {args.case} had no "
                   f"forward signal for {stall_minutes}m (elapsed {elapsed}s)"
                   " — aborting case for early investigation")
+            _stop_agent_turn(args, args.case)
             post = paths["vol"] / f"history.post-case-{args.run_id}-{args.case}.metta"
             _sudo_run(["cp", str(paths["history"]), str(post)])
             _write_json(RESULTS_DIR / args.run_id / f"agent-case-{args.case}.json", {
@@ -1793,6 +2414,7 @@ def agent_case(args) -> int:
             return 1
         time.sleep(30)
 
+    _stop_agent_turn(args, args.case)
     post = paths["vol"] / f"history.post-case-{args.run_id}-{args.case}.metta"
     _sudo_run(["cp", str(paths["history"]), str(post)])
     print(f"[agent-case] TIMEOUT on case {args.case}")
@@ -2032,8 +2654,13 @@ def grade_case(args) -> int:
     reasoning_json = _load_json(
         rd / f"setup-reasoning-case-{args.case}.json") or {}
     live_since_iso = reasoning_json.get("restarted_at") or since_iso
-    receipt_census = _census_persist_receipts(live_since_iso, _now_iso(),
-                                               extra_logs=phase1_logs)
+    # openclaw profile: the census unions the receipts sidecar; omega keeps
+    # the exact historical call shape (its test stubs pin it)
+    census_kwargs = ({"profile": _profile(args),
+                       "memory_volume": _memory_volume(args)}
+                      if _profile(args) is not OMEGA_PROFILE else {})
+    receipt_census = _census_persist_receipts(
+        live_since_iso, _now_iso(), extra_logs=phase1_logs, **census_kwargs)
     _write_json(rd / f"persist-receipts-{args.case}.json", receipt_census)
     window_receipt_count = len(persist_receipts)
     if receipt_census.get("count", 0) > 0:
@@ -2046,8 +2673,9 @@ def grade_case(args) -> int:
     # discipline as the persist-receipt census: live-only evidence first).
     # v2: phase-1 pins come from the phase1-docker.log snapshot (same
     # merge as the persist-receipt census).
-    ledger_pin_census = _census_ledger_pins(live_since_iso, _now_iso(),
-                                            extra_logs=phase1_logs)
+    ledger_pin_census = _census_ledger_pins(
+        live_since_iso, _now_iso(), extra_logs=phase1_logs,
+        profile=_profile(args))
     _write_json(rd / f"ledger-pins-{args.case}.json", ledger_pin_census)
     adherence = _adherence_lane(args.case, ledger_pin_census, answers)
 
@@ -2139,12 +2767,17 @@ def grade_case(args) -> int:
 
 def teardown(args) -> int:
     """Teardown phase: restore agent to standby (contamination guard kept)."""
+    profile = _profile(args)
     paths = _bench_paths(args)
     if args.dry_run:
         print(f"[teardown] [dry-run] contamination guard, restore prompt/state, "
               "restore history from the pre-benchmark backup (v4 trim), "
               "restart, optionally remove per-case volume snapshots")
         return 0
+
+    # R-A2: any lingering delivery turn of this run is stopped (best-effort)
+    for (run_id, case_id) in [k for k in _DELIVERY_PROCS if k[0] == args.run_id]:
+        _stop_agent_turn(args, case_id)
 
     try:
         backup_prompt = paths["vol"] / f"prompt.txt.bak-pre-benchmark-{args.run_id}"
@@ -2167,7 +2800,10 @@ def teardown(args) -> int:
             return 1
 
         _sudo_run(["cp", str(backup_prompt), str(paths["prompt"])])
-        _sudo_run(["cp", str(paths["vol"] / f"omega_state.md.bak-pre-benchmark-{args.run_id}"),
+        # state restore: omega → omega_state.md.bak-…; openclaw → the state
+        # backup IS the prompt backup (same file name) — the cp is the same
+        # standby restore, and the completion note appends to prompt.txt
+        _sudo_run(["cp", str(paths["vol"] / f"{profile.state_file}.bak-pre-benchmark-{args.run_id}"),
                    str(paths["state"])])
         subprocess.run(
             ["sudo", "tee", "-a", str(paths["state"])],
@@ -2192,7 +2828,12 @@ def teardown(args) -> int:
             _sudo_run(["rm", "-f", str(hist_bak)])
             print("[teardown] history restored from the pre-benchmark backup "
                   "(per-case trim reverted)")
-        if not _agent_restart():
+        # profile-routed restart (omega keeps the historical zero-arg call)
+        if profile is OMEGA_PROFILE:
+            restart_ok = _agent_restart()
+        else:
+            restart_ok = _agent_restart(profile)
+        if not restart_ok:
             print("[teardown] ERROR: agent restart failed")
             return 1
 
@@ -2750,7 +3391,7 @@ def setup(args) -> int:
     _sudo_run(["cp", str(paths["prompt"]),
                str(paths["vol"] / f"prompt.txt.bak-pre-benchmark-{args.run_id}")])
     _sudo_run(["cp", str(paths["state"]),
-               str(paths["vol"] / f"omega_state.md.bak-pre-benchmark-{args.run_id}")])
+               str(paths["vol"] / f"{_profile(args).state_file}.bak-pre-benchmark-{args.run_id}")])
 
     # batch prompt: render the template once per case, all cases listed
     template = (HERE / "agent_prompt_template.md").read_text(encoding="utf-8")
@@ -2758,11 +3399,16 @@ def setup(args) -> int:
     if not _sudo_write(paths["prompt"], rendered):
         print("[setup] ERROR: prompt install failed")
         return 1
-    _sudo_write(paths["state"], f"BENCHMARK MODE ACTIVE — run {args.run_id} (batch)\n")
+    if paths["state"] != paths["prompt"]:
+        _sudo_write(paths["state"], f"BENCHMARK MODE ACTIVE — run {args.run_id} (batch)\n")
     _sudo_write(paths["vol"] / f"history.pre-benchmark-{args.run_id}.metta",
                 _sudo_read(paths["history"]) or "")
-    _sudo_run(["chown", "-R", "65534:65534", str(paths["bench"])])
-    if not _agent_restart():
+    _sudo_run(["chown", "-R", _profile(args).bench_owner, str(paths["bench"])])
+    if _profile(args) is OMEGA_PROFILE:
+        restart_ok = _agent_restart()
+    else:
+        restart_ok = _agent_restart(_profile(args))
+    if not restart_ok:
         print("[setup] ERROR: restart failed")
         return 1
 
@@ -2847,7 +3493,19 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--run-id", default=_run_id())
         p.add_argument("--repo-remote", default="https://github.com/ktfh-claw/low-cost-omega-setup.git")
         p.add_argument("--origin-main-sha", default="")
-        p.add_argument("--memory-volume", default=DEFAULT_MEMORY_VOLUME)
+        p.add_argument("--agent-profile", default="omega",
+                       choices=sorted(AGENT_PROFILES),
+                       help="agent under test: omega (default — the deployed "
+                            "Omega agent; behavior byte-identical to the "
+                            "pre-adapter harness) or openclaw (the "
+                            "OpenClaw-SUT gateway: file_plus_agent_turn "
+                            "prompt delivery + receipts-sidecar census)")
+        p.add_argument("--memory-volume", default="",
+                       help="agent memory volume root (default: the "
+                            "profile's volume — omega: "
+                            "/var/lib/docker/volumes/omega-curiosity-memory/_data, "
+                            "openclaw: "
+                            "/var/lib/docker/volumes/openclaw-sut-workspace/_data)")
         p.add_argument("--provenance-repo", default=DEFAULT_PROVENANCE_REPO)
         p.add_argument("--write-bridge", default=DEFAULT_WRITE_BRIDGE)
         p.add_argument("--read-proxy", default=DEFAULT_READ_PROXY)
@@ -2972,6 +3630,11 @@ def main() -> int:
     if not args.phase:
         parser.print_help()
         return 1
+
+    # profile seam: resolve the memory-volume default per profile (an
+    # explicit --memory-volume always wins; empty means "the profile's")
+    if not getattr(args, "memory_volume", ""):
+        args.memory_volume = _profile(args).memory_volume_default
 
     dispatch = {
         "preflight": preflight, "cleanup-das": cleanup_das,
