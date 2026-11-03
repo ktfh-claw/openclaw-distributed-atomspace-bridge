@@ -1,42 +1,83 @@
-# Dockerfile.sut — OpenClaw-SUT wrapper image (spec R-D2).
+# Dockerfile.sut — OpenClaw-SUT wrapper image (spec R-D2, amended by
+# specs/openclaw-sut-adapter/spec-addendum-metta-runtime.md).
 #
 # Wrapper stage on the pinned base tag openclaw/openclaw:2026.10.10 (index
 # digest sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799,
-# verified by deploy.sh stage 2 at pull). It installs ONLY the MeTTa runtime
-# (hyperon via pip, plus python3 if the base lacks it) and the vendored
-# NAL/PLN libraries under /opt/sut-metta/ (committed by the orchestrator —
-# see metta-libs/README.md; extracted verbatim from
-# omegaclaw:v0.1.23-6376e99). No other mutation of the base image.
+# verified by deploy.sh stage 2 at pull). It installs ONLY the MeTTa
+# runtime and the vendored NAL/PLN libraries under /opt/sut-metta/:
+#
+# - SWI-Prolog 10.0.2 copied from the official docker.io/library/swipl:10.0.2
+#   image (the exact base Omega's runtime image omegaclaw:v0.1.23-6376e99 is
+#   built on) — no pip hyperon (superseded by the addendum).
+# - PeTTa v1.0.4 (https://github.com/trueagi-io/PeTTa.git, commit
+#   7037f4c2ad378c52fc328004fe216d5118b674f0) pulled at build time from
+#   upstream, pinned by commit. Only src/*.pl is kept: without the `mork`
+#   argv flag, src/metta.pl loads exactly [parser, translator, specializer,
+#   filereader, spaces] beside main.pl — nothing from PeTTa's build.sh
+#   (faiss/mork/chroma) is needed or fetched.
+# - python3 for the skills' wrapper scripts (the pinned node:bookworm-slim
+#   base lacks it; the runtime itself needs no Python code — libpython3.11
+#   is only a link dependency of swipl's janus.so).
+#
+# No other mutation of the base image.
+
+# --- build stage: upstream PeTTa, pinned by commit ------------------------
+# The official swipl:10.0.2 image (Debian bookworm) provides git via apt
+# for the clone; it never enters the final image.
+FROM docker.io/library/swipl:10.0.2 AS petta-build
+RUN set -eux; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
+    git clone https://github.com/trueagi-io/PeTTa.git /opt/petta; \
+    cd /opt/petta; \
+    git checkout 7037f4c2ad378c52fc328004fe216d5118b674f0; \
+    rm -rf .git; \
+    test -f src/main.pl; \
+    test -f src/metta.pl; \
+    test -f src/parser.pl; \
+    test -f src/translator.pl; \
+    test -f src/specializer.pl; \
+    test -f src/filereader.pl; \
+    test -f src/spaces.pl
+
+# --- wrapper stage ---------------------------------------------------------
 FROM openclaw/openclaw:2026.10.10
 
 USER root
 
-# MeTTa runtime: python3 + pip (only if the base lacks them — idempotent
-# install, both Debian/apt and Alpine/apk bases covered) + the hyperon
-# package.
+# SWI-Prolog 10.0.2 runtime, copied verbatim from the pinned official image.
+# /usr/lib/swipl is the SWI_HOME_DIR (boot files, library/, and
+# lib/x86_64-linux/ incl. libswipl.so.10 and the foreign modules — the
+# binary's RUNPATH /usr/lib/swipl/lib/x86_64-linux resolves it).
+COPY --from=docker.io/library/swipl:10.0.2 /usr/bin/swipl /usr/bin/swipl
+COPY --from=docker.io/library/swipl:10.0.2 /usr/lib/swipl /usr/lib/swipl
+# Shared libraries the pinned base (node:24.22.1-bookworm-slim) lacks,
+# exactly the DT_NEEDED delta of the copied runtime: libtcmalloc_minimal.so.4
+# (the swipl binary) and libpython3.11.so.1.0 (janus.so, loaded by
+# library(janus) which src/metta.pl use_module()s). bookworm-slim already
+# ships libtinfo.so.6 / libgmp.so.10 / libz.so.1 that libswipl.so.10 needs.
+COPY --from=docker.io/library/swipl:10.0.2 /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4
+COPY --from=docker.io/library/swipl:10.0.2 /usr/lib/x86_64-linux-gnu/libpython3.11.so.1.0 /usr/lib/x86_64-linux-gnu/libpython3.11.so.1.0
+
+# PeTTa v1.0.4 interpreter — only the src/*.pl the pinned invocation
+# `swipl --stack_limit=8g -q -s src/main.pl -- <file>` needs (cwd=/opt/petta;
+# main.pl loads its siblings relative to itself; the `mork` argv flag that
+# would pull ../mork_ffi/morkspaces is never passed).
+COPY --from=petta-build /opt/petta/src /opt/petta/src
+
+# python3 for the skills' wrapper scripts (metta_run.py and the DAS lanes /
+# provider verify probes run python3 inside the container; the pinned base
+# is bookworm-slim and ships none). Idempotent: install only if absent.
 RUN set -eux; \
     if ! command -v python3 >/dev/null 2>&1; then \
-        if command -v apt-get >/dev/null 2>&1; then \
-            apt-get update; \
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-pip; \
-            rm -rf /var/lib/apt/lists/*; \
-        elif command -v apk >/dev/null 2>&1; then \
-            apk add --no-cache python3 py3-pip; \
-        else \
-            echo "ERROR: no supported package manager to install python3" >&2; exit 1; \
-        fi; \
-    elif ! python3 -m pip --version >/dev/null 2>&1; then \
-        if command -v apt-get >/dev/null 2>&1; then \
-            apt-get update; \
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-pip; \
-            rm -rf /var/lib/apt/lists/*; \
-        elif command -v apk >/dev/null 2>&1; then \
-            apk add --no-cache py3-pip; \
-        fi; \
+        apt-get update; \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-minimal; \
+        rm -rf /var/lib/apt/lists/*; \
     fi; \
-    python3 -m pip install --no-cache-dir hyperon \
-        || python3 -m pip install --no-cache-dir --break-system-packages hyperon; \
-    python3 -c "import hyperon; print('hyperon', hyperon.__version__ if hasattr(hyperon, '__version__') else 'ok')"
+    ldconfig; \
+    python3 --version; \
+    swipl --version
 
 # Mountpoints for the named volumes (deploy.sh stage 3 seeds the workspace;
 # the state volume carries the onboarded config). The image's non-root user
@@ -47,8 +88,21 @@ RUN set -eux; \
     mkdir -p /var/openclaw/state /var/openclaw/workspace /opt/sut-metta; \
     chown -R 1000:1000 /var/openclaw
 
-# Vendored NAL/PLN libraries (verbatim from omegaclaw:v0.1.23-6376e99;
-# orchestrator-committed — the build fails without them by design).
+# Vendored NAL/PLN libraries (byte-identical to singnet/Omega @ b94f7bf —
+# provenance and anyone-can-repeat fetch in metta-libs/README.md; the build
+# fails without them by design).
 COPY metta-libs/lib_nal.metta metta-libs/lib_pln.metta /opt/sut-metta/
+
+# Build-time runtime gate: the NAL probe through the exact invocation
+# metta_run.py uses (same flags, same cwd shape). The last stdout line is
+# the evaluation result (interpreter trace noise precedes it) and must
+# carry an (stv ...) truth value — a broken runtime copy (missing shared
+# libs, wrong swipl home, bad PeTTa checkout) fails the build here.
+RUN set -eux; \
+    printf '!(import! &self "/opt/sut-metta/lib_nal.metta")\n!(import! &self "/opt/sut-metta/lib_pln.metta")\n!(|- ((--> smoke-a smoke-b) (stv 1.0 0.9)) ((--> smoke-a smoke-c) (stv 1.0 0.9)))\n' > /tmp/sut-build-smoke.metta; \
+    cd /opt/petta; \
+    swipl --stack_limit=8g -q -s src/main.pl -- /tmp/sut-build-smoke.metta > /tmp/sut-build-smoke.out; \
+    tail -n 1 /tmp/sut-build-smoke.out | grep -q '(stv '; \
+    rm -f /tmp/sut-build-smoke.metta /tmp/sut-build-smoke.out
 
 USER node
