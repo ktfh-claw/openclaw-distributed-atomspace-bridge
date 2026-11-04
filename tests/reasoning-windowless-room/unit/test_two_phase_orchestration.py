@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""v2 two-phase orchestration tests (skill-split directive 2026-11-02
-08:25 UTC).
+"""oc2 shared-KB orchestration tests (oc2-openclaw-native, directive
+2026-11-04 22:54/22:58 UTC).
 
-Pins the per-case two-phase flow the addendum requires:
-- Phase 1 EXTRACTION prompt + agent restart; completion signal = the
-  checkpoint manifest appearing in the memory volume
-  knowledge-checkpoints/ (poll ~30s, bounded by the phase timeout).
-- On manifest-poll timeout WITHOUT a manifest: grade as-is — the phase
-  boundary is never invented.
-- The phase-1 container docker logs are snapshotted into
-  results/<run-id>/windows/<case>/phase1-docker.log BEFORE the phase-2
-  restart (the systemd unit rm -f's the container on restart — logs die
-  with it).
-- Phase 2 REASONING prompt + fresh restart: the census lanes merge the
-  phase-1 snapshot with the live phase-2 window.
+Pins the shared one-time extraction flow (C3) + per-phase session ids
+(C6) + harness-side manifest archive (C4) + the receipts-sidecar
+forward-signal lane (C5):
+- ONE run-level EXTRACTION phase (all 3 case questions as context),
+  once per run; per-case REASONING phases with fresh sessions.
+- Completion signal = the checkpoint manifest appearing in the memory
+  volume knowledge-checkpoints/ (poll ~30s, bounded by the phase
+  timeout). On timeout WITHOUT a manifest the per-case reasoning still
+  runs — each case graded truthfully; the boundary is never invented.
+- The extraction container's docker logs are snapshotted into
+  results/<run-id>/windows/extract/phase1-docker.log BEFORE the first
+  reasoning restart (the systemd unit rm -f's the container on
+  restart — logs die with it); the grade census lanes merge the
+  snapshot with the live reasoning window.
+- Stale manifests archive to results/<run-id>/archive-manifests/
+  (harness-side, OUTSIDE the agent-readable knowledge-checkpoints/).
 
 All tests are pure logic (monkeypatched IO — no docker, no sudo).
 """
@@ -443,6 +447,20 @@ def test_setup_case_phase_dispatch_renders_phase_templates():
     assert "REASONING (das-grounded-reasoning skill)" in fat
 
 
+def test_shared_extraction_render_carries_all_questions():
+    """oc2 C3: the extraction prompt is SHARED — it carries ALL THREE
+    case questions as extraction context (no per-case framing; the
+    rendered questions are CONTEXT, never answered in this phase)."""
+    args = _args()
+    ext = rb._render_extraction_prompt(args, None)
+    for c in rb._facts_mod().TEST_CASES:
+        assert c["question"] in ext, f"missing question: {c['id']}"
+    assert "This case's question" not in ext, "per-case framing removed"
+    assert "CONTEXT" in ext
+    assert "do NOT answer the questions in this phase" in ext
+    assert "{{ALL_QUESTIONS}}" not in ext, "template not fully substituted"
+
+
 def test_phase_templates_word_count_under_half():
     """A2: each phase prompt well under half the current fat template's
     2483 words (oc2-openclaw-native: pin-free fat template)."""
@@ -456,6 +474,57 @@ def test_phase_templates_word_count_under_half():
     assert fat == 2700, f"fat template drifted: {fat}"
     assert ext < fat // 2, f"extraction template too fat: {ext} >= {fat//2}"
     assert rea < fat // 2, f"reasoning template too fat: {rea} >= {fat//2}"
+
+
+# oc1 (base 08006eb) word counts — frozen historical facts, pinned so a
+# future template edit cannot silently grow the prompts past the oc1
+# directive ("prompt templates SHORTER than the oc1 versions").
+OC1_FAT_WORDS = 3391
+OC1_EXTRACTION_TEMPLATE_WORDS = 554
+OC1_REASONING_TEMPLATE_WORDS = 1115
+# oc1 RENDERED extraction (one case's question as context): per case.
+OC1_RENDERED_EXTRACTION_WORDS = {"original": 577, "unsolvable": 564,
+                                 "false": 573}
+# oc1 RENDERED reasoning: per case.
+OC1_RENDERED_REASONING_WORDS = {"original": 1138, "unsolvable": 1125,
+                                "false": 1134}
+
+
+def test_templates_do_not_grow_vs_oc1():
+    """oc2 acceptance 5: the diff SHAPE is net deletions — every template
+    file must be SHORTER than its oc1 (08006eb) version (word count must
+    not grow)."""
+    here = rb.HERE
+    fat = len((here / "agent_prompt_template.md").read_text(
+        encoding="utf-8").split())
+    ext = len((here / "agent_extraction_prompt_template.md").read_text(
+        encoding="utf-8").split())
+    rea = len((here / "agent_reasoning_prompt_template.md").read_text(
+        encoding="utf-8").split())
+    assert fat < OC1_FAT_WORDS, f"fat template grew vs oc1: {fat}"
+    assert ext < OC1_EXTRACTION_TEMPLATE_WORDS, \
+        f"extraction template grew vs oc1: {ext}"
+    assert rea < OC1_REASONING_TEMPLATE_WORDS, \
+        f"reasoning template grew vs oc1: {rea}"
+
+
+def test_rendered_prompts_do_not_grow_vs_oc1():
+    """oc2 acceptance 5, on the RENDERED prompts (the binding claim —
+    the oc2 shared extraction render carries ALL THREE case questions
+    yet must not exceed the SMALLEST oc1 per-case extraction render;
+    each reasoning render must not exceed its oc1 counterpart)."""
+    args = _args()
+    ext = rb._render_extraction_prompt(args, None)
+    ext_words = len(ext.split())
+    smallest_oc1 = min(OC1_RENDERED_EXTRACTION_WORDS.values())
+    assert ext_words <= smallest_oc1, \
+        f"rendered shared extraction ({ext_words} words) grew past the " \
+        f"smallest oc1 per-case render ({smallest_oc1})"
+    for cid, oc1_words in OC1_RENDERED_REASONING_WORDS.items():
+        case = rb._case_by_id(cid)
+        rea_words = len(rb._render_reasoning_prompt(args, case).split())
+        assert rea_words <= oc1_words, \
+            f"rendered reasoning ({cid}) grew vs oc1: {rea_words} > {oc1_words}"
 
 
 def test_phase_templates_carry_source_url_wiring():

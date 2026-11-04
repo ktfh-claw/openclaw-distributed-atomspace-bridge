@@ -142,18 +142,31 @@ From `tests/reasoning-windowless-room/` on the host with this checkout:
 
 ```bash
 python3 run_benchmark.py --agent-profile openclaw preflight --run-id <run-id>
-python3 run_benchmark.py --agent-profile openclaw full --two-phase --run-id <run-id>
+python3 run_benchmark.py --agent-profile openclaw full --run-id <run-id>
 ```
 
+- run flow (oc2, shared-KB): preflight → cleanup-das → ONE run-level
+  extraction phase (all 3 case questions as context; the corpus is
+  extracted ONCE per run) → checkpoint-manifest poll + extraction log
+  snapshot → per-case reasoning turns → grade → report → teardown.
+  `--two-phase` is a deprecated no-op alias (the shared-KB flow IS
+  two-phase and is the default `full` path).
 - prompt delivery: the harness writes the rendered `prompt.txt` into the
-  workspace volume exactly as for Omega and then starts a real gateway turn:
-  `docker exec openclaw-sut-gateway openclaw agent --message-file
-  /var/openclaw/workspace/prompt.txt --session-id wr-<run_id>-<case_id>
-  --no-color` (non-blocking; re-issued on nonzero exit or a stall via the
-  existing stall/phase-timeout machinery)
+  workspace volume exactly as for Omega and then starts a real gateway
+  turn with a PER-PHASE session id (oc2 C6): `wr-<run_id>-extract` for
+  the shared extraction turn, `wr-<run_id>-case-<case_id>` for each
+  per-case reasoning turn — `docker exec openclaw-sut-gateway openclaw
+  agent --message-file /var/openclaw/workspace/prompt.txt --session-id
+  <session-id> --no-color` (non-blocking; re-issued on nonzero exit or
+  a stall via the existing stall/phase-timeout machinery; distinct
+  sessions keep gateway restart-recovery from re-dispatching a stale
+  phase's zombie into the live phase's session)
 - receipts census: docker logs (primary) ∪
   `benchmark/persist-receipts.log` sidecar (ISO-8601 lines appended by the
-  das-write skill), identical `(timestamp, handle)` dedup
+  das-write skill), identical `(timestamp, handle)` dedup; the
+  stall-watchdog fresh-receipt forward signal reads the same two lanes
+  (oc2 C5 — receipts can flow sidecar-only while the docker-log grep
+  stays silent)
 - restarts: `sudo systemctl restart openclaw-sut.service` (recreates the
   container; the unit re-attaches the DAS network)
 - `--dry-run` prints the full profile-resolved plan (including the exact
