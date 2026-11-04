@@ -61,7 +61,7 @@ ASI1_BASE_URL="https://api.asi1.ai/v1"
 ASI1_MODEL="asi1-ultra"
 SEED_MARKER=".sut-seeded"
 RUNTIME_ENV="runtime.env"
-SUT_SKILLS="das-write das-retrieve metta pin das-extract-knowledge das-grounded-reasoning"
+SUT_SKILLS="das-write das-retrieve metta das-extract-knowledge das-grounded-reasoning"
 
 SECRETS_FILE="${SECRETS_ENV_FILE:-}"
 
@@ -142,6 +142,17 @@ stage3_volume() {
   log "stage 3/10: workspace volume + seed"
   docker volume create "$WORKSPACE_VOLUME" >/dev/null
 
+  # Stale-skill removal (idempotent, runs on every deploy): a prior
+  # deployment may carry the retired pin skill in its workspace volume;
+  # remove it via a one-off container so the removal works whether or
+  # not the gateway is running.
+  docker run --rm --entrypoint sh \
+      -v "$WORKSPACE_VOLUME:/var/openclaw/workspace" \
+      "$SUT_IMAGE" \
+      -c "rm -rf /var/openclaw/workspace/skills/pin" 2>/dev/null \
+    && log "stage 3/10: stale pin skill removed from the workspace volume (if present)" \
+    || log "stage 3/10: stale pin skill removal non-fatal (volume may be fresh)"
+
   if docker run --rm --entrypoint sh \
       -v "$WORKSPACE_VOLUME:/var/openclaw/workspace" "$SUT_IMAGE" \
       -c "test -f /var/openclaw/workspace/$SEED_MARKER" 2>/dev/null; then
@@ -150,17 +161,17 @@ stage3_volume() {
   fi
 
   docker run --rm --entrypoint sh \
-    -v "$WORKSPACE_VOLUME:/var/openclaw/workspace" \
-    -v "$REPO_ROOT/skills-sut:/skills-src:ro" \
-    -v "$SCRIPT_DIR/workspace-seed:/seed-src:ro" \
-    "$SUT_IMAGE" -c '
+      -v "$WORKSPACE_VOLUME:/var/openclaw/workspace" \
+      -v "$REPO_ROOT/skills-sut:/skills-src:ro" \
+      -v "$SCRIPT_DIR/workspace-seed:/seed-src:ro" \
+      "$SUT_IMAGE" -c '
       set -e
       cp -r /seed-src/. /var/openclaw/workspace/
       mkdir -p /var/openclaw/workspace/skills
       cp -r /skills-src/. /var/openclaw/workspace/skills/
       touch /var/openclaw/workspace/'"$SEED_MARKER"'
     '
-  log "stage 3/10: volume seeded (workspace-seed/ + the six skills from skills-sut/)"
+  log "stage 3/10: volume seeded (workspace-seed/ + the five skills from skills-sut/)"
 }
 
 # ---------------------------------------------------------------------------

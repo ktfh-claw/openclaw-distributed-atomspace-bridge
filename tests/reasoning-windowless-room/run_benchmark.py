@@ -550,99 +550,32 @@ def _union_receipt_census(docker_matched: list[str], sidecar_text: str,
 
 DEFAULT_STALL_MINUTES = 25
 
-# Emission lane only: the agent's pin tool calls appear in docker logs as
-# ``COMMAND_RETURN: ((pin "LEDGER: ...") "SUCCESS, RETURN: PIN-SUCCESS")``.
-# The same LEDGER text is echoed ~8x inside later LLMRequest prompt lines
-# (live wr3t: 74 echo lines vs 9 emission lines) — echoes are excluded by
-# the same LLMRequest-line exclusion the persist-receipt census uses.
-LEDGER_PIN_RE = re.compile(r'COMMAND_RETURN: \(\(pin "(LEDGER: [^"]*)"')
 
-
-def _census_ledger_pins(since_iso: str, until_iso: str,
-                        extra_logs: str = "", profile: AgentProfile | None = None
-                        ) -> dict:
-    """Collect the LEDGER lines the agent actually PINNED (emission lane,
-    COMMAND_RETURN only), in order, bounded by [since, until].
-
-    extra_logs (v2 two-phase): phase-1 container log text snapshotted
-    BEFORE the phase-2 restart (the container is rm'd at the restart, so
-    its live logs cover only the phase-2 window) — scanned with the same
-    emission-lane rules and PREPENDED to the live window's pins.
-
-    Docker/log errors are NOT gate evidence: empty pins + ``error``
-    recorded (classify_adherence then sees no pinned claim —
-    conservative, same failure mode as the persist-receipt census)."""
-    out: dict = {"pins": [], "window": [since_iso, until_iso]}
-    logs = extra_logs
-    try:
-        logs += _docker_logs_since(
-            (profile or OMEGA_PROFILE).container_agent, since_iso, until_iso)
-    except Exception as e:  # docker down / container gone: not gate evidence
-        out["error"] = str(e)[:200]
-    if extra_logs:
-        out["extra_source"] = "phase1-docker.log"
-    # v2 two-phase: order-preserving de-dupe of RAW log lines — identical
-    # full lines (timestamp included) only occur when the phase-1 snapshot
-    # window overlaps the live window (phase 2 skipped, graded as-is);
-    # genuine re-emissions carry different timestamps and survive.
-    lines = list(dict.fromkeys(logs.splitlines()))
-    pins: list[str] = []
-    for ln in lines:
-        if "LLMRequest[" in ln:
-            continue  # prompt echo, not an emission
-        m = LEDGER_PIN_RE.search(ln)
-        if m:
-            pins.append(m.group(1))
-    # de-duplicate consecutive identical re-pins (pin is a no-op dedup on
-    # the agent side; the ordered unique sequence is the claim sequence)
-    deduped: list[str] = []
-    for p in pins:
-        if not deduped or deduped[-1] != p:
-            deduped.append(p)
-    out["pins"] = deduped
-    return out
-
-
-def classify_adherence(case_id: str, last_ledger_pin: str,
-                       answers_text: str) -> list[str]:
-    """State-vs-claim cross-check (delta 1): compare the LAST pinned
-    ledger claim against the actual answers.md state for this case.
+def classify_adherence(case_id: str, answers_text: str) -> list[str]:
+    """State-vs-claim cross-check: check the answers.md state for this
+    case. The pin-derived ``ADHERENCE_FALSE_COMPLETION`` condition is
+    removed with the pin channel (oc2-openclaw-native spec C1); only the
+    answers-file-based ``ADHERENCE_DUPLICATE_BLOCK`` check remains.
 
     Conditions (additive layer; mechanism gate unchanged):
     - ADHERENCE_DUPLICATE_BLOCK: more than one ``### CASE <id>`` block —
       the wr3q/wr3s duplicate discipline breach (last-wins grading hides
       it from the mechanism gate).
-    - ADHERENCE_FALSE_COMPLETION: the terminal pin claims ``answer block
-      written`` while the case block does NOT exist in answers.md — the
-      wr3r/wr3t false pre-write claim class.
-    An intermediate close-out pin with no block is an INCOMPLETE case
-    (the timeout lane already covers it) — not a false claim. No pins at
-    all is clean (nothing claimed)."""
+    """
     conds: list[str] = []
     block_count = answers_text.count(f"### CASE {case_id}")
     if block_count > 1:
         conds.append("ADHERENCE_DUPLICATE_BLOCK")
-    if ("answer block written" in (last_ledger_pin or "")
-            and block_count == 0):
-        conds.append("ADHERENCE_FALSE_COMPLETION")
     return conds
 
 
-def _adherence_lane(case_id: str, pin_census: dict,
-                    answers_text: str) -> dict:
+def _adherence_lane(case_id: str, answers_text: str) -> dict:
     """Assemble the per-case adherence lane (conditions + evidence)."""
-    pins = pin_census.get("pins", [])
-    last_pin = pins[-1] if pins else ""
-    conditions = classify_adherence(case_id, last_pin, answers_text)
+    conditions = classify_adherence(case_id, answers_text)
     return {
         "conditions": conditions,
         "evidence": {
-            "last_ledger_pin": last_pin,
             "block_count": answers_text.count(f"### CASE {case_id}"),
-            "ledger_pin_count": len(pins),
-            "pin_window": pin_census.get("window"),
-            **({"pin_census_error": pin_census["error"]}
-               if "error" in pin_census else {}),
         },
     }
 
@@ -985,7 +918,7 @@ def _preflight_openclaw_checks(args, profile: AgentProfile,
             checks[f"{lane}_reachable_from_sut"] = f"error: {e}"
 
     missing_skills: list[str] = []
-    for skill in ("das-write", "das-retrieve", "metta", "pin",
+    for skill in ("das-write", "das-retrieve", "metta",
                   "das-extract-knowledge", "das-grounded-reasoning"):
         try:
             r = _run(["docker", "exec", profile.container_agent, "test", "-d",
@@ -1684,13 +1617,20 @@ def _render_case_prompt(args, case: dict) -> str:
 
 
 def _render_extraction_prompt(args, case: dict) -> str:
-    """Render agent_extraction_prompt_template.md for ONE case (v2 two-phase)."""
+    """Render agent_extraction_prompt_template.md — the SHARED extraction
+    prompt (oc2-openclaw-native C3): lists ALL THREE case questions as
+    extraction context, names the corpus sources once. The ``case``
+    parameter is retained for call-site compatibility (the v2 per-case
+    rendering); its question is NOT rendered — the shared prompt carries
+    every case's question."""
     profile = _profile(args)
     template = (HERE / "agent_extraction_prompt_template.md").read_text(encoding="utf-8")
+    facts_mod = _facts_mod()
+    all_questions = "\n".join(f"- {c['question']}"
+                              for c in facts_mod.TEST_CASES)
     return _apply_profile_prompt_paths((template
             .replace("{{RUN_ID}}", args.run_id)
-            .replace("{{CASE_ID}}", case["id"])
-            .replace("{{QUESTION}}", case["question"])
+            .replace("{{ALL_QUESTIONS}}", all_questions)
             .replace("{{URL_LIST_PATH}}", profile.urls_prompt_rel)
             .replace("{{ANSWERS_PATH}}", profile.answers_prompt_rel)
             .replace("{{FACTS_INDEX_PATH}}", profile.facts_index_prompt_rel)),
@@ -2699,18 +2639,12 @@ def grade_case(args) -> int:
     if receipt_census.get("count", 0) > 0:
         window_receipt_count = receipt_census["count"]
 
-    # L1 delta 1+2 (Balázs directive 2026-10-30 23:50 UTC): state-vs-claim
-    # adherence cross-check — the LAST pinned ledger claim vs the actual
-    # answers.md block state, from the docker-log pin emission lane. The
-    # census is persisted BEFORE the reconstruction lane (same ordering
-    # discipline as the persist-receipt census: live-only evidence first).
-    # v2: phase-1 pins come from the phase1-docker.log snapshot (same
-    # merge as the persist-receipt census).
-    ledger_pin_census = _census_ledger_pins(
-        since_iso, _now_iso(), extra_logs=phase1_logs,
-        profile=_profile(args))
-    _write_json(rd / f"ledger-pins-{args.case}.json", ledger_pin_census)
-    adherence = _adherence_lane(args.case, ledger_pin_census, answers)
+    # L1 delta 1+2: state-vs-claim adherence cross-check — the answers.md
+    # block state for this case (duplicate-block check only; the pin
+    # channel is gone, oc2-openclaw-native spec C1). The census is
+    # persisted BEFORE the reconstruction lane (same ordering discipline
+    # as the persist-receipt census: live-only evidence first).
+    adherence = _adherence_lane(args.case, answers)
 
     # P-gate input: the Phase-4 reconstruction script's JSON payload for
     # this case (trace + FACTS + HANDLES in; conditions out). Harness

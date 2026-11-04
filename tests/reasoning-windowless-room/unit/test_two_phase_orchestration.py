@@ -400,26 +400,6 @@ def test_census_persist_receipts_without_extra_logs_unchanged():
         rb._docker_logs_since = saved
 
 
-def test_census_ledger_pins_merges_phase1_snapshot():
-    """The L1 adherence pin census merges phase-1 snapshot pins with the
-    live phase-2 window (same emission-lane rules)."""
-    pin_p1 = ("2026-11-02 10:05:00 | (COMMAND_RETURN: ((pin \"LEDGER: "
-              "step 1 | done: extraction underway\") \"SUCCESS\"))")
-    pin_p2 = ("2026-11-02 11:05:00 | (COMMAND_RETURN: ((pin \"LEDGER: "
-              "step 5 | done: answer block written\") \"SUCCESS\"))")
-    phase1_logs = pin_p1 + "\n"
-    saved = rb._docker_logs_since
-    rb._docker_logs_since = lambda c, s, u: pin_p2 + "\n"
-    try:
-        out = rb._census_ledger_pins("s", "u", extra_logs=phase1_logs)
-        assert out["pins"] == [
-            "LEDGER: step 1 | done: extraction underway",
-            "LEDGER: step 5 | done: answer block written",
-        ], out["pins"]
-    finally:
-        rb._docker_logs_since = saved
-
-
 # ---------------------------------------------------------------------------
 # phase-specific prompt rendering (setup_case phase= dispatch)
 # ---------------------------------------------------------------------------
@@ -451,7 +431,7 @@ def test_setup_case_phase_dispatch_renders_phase_templates():
 
 def test_phase_templates_word_count_under_half():
     """A2: each phase prompt well under half the current fat template's
-    3391 words."""
+    2483 words (oc2-openclaw-native: pin-free fat template)."""
     here = rb.HERE
     fat = len((here / "agent_prompt_template.md").read_text(
         encoding="utf-8").split())
@@ -459,7 +439,7 @@ def test_phase_templates_word_count_under_half():
         encoding="utf-8").split())
     rea = len((here / "agent_reasoning_prompt_template.md").read_text(
         encoding="utf-8").split())
-    assert fat == 3391, f"fat template drifted: {fat}"
+    assert fat == 2700, f"fat template drifted: {fat}"
     assert ext < fat // 2, f"extraction template too fat: {ext} >= {fat//2}"
     assert rea < fat // 2, f"reasoning template too fat: {rea} >= {fat//2}"
 

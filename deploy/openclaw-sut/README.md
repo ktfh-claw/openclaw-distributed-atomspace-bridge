@@ -63,9 +63,11 @@ cd deploy/openclaw-sut
 3. **volume + seed** — create `openclaw-sut-workspace`, seed it once from
    `workspace-seed/` (AGENTS.md, standby `prompt.txt`, empty
    `history.metta`, `benchmark/` scaffold: answers.md, facts-index.md,
-   urls.txt, pinned-ledger.md, knowledge-checkpoints/) plus the six skills
+   urls.txt, knowledge-checkpoints/) plus the five skills
    from `<repo>/skills-sut/`; the `.sut-seeded` marker makes it idempotent
-   (delete the marker — or the volume — to reseed).
+   (delete the marker — or the volume — to reseed). A stale
+   `skills/pin` directory from a prior deployment is removed
+   idempotently (the pin skill is retired, oc2-openclaw-native C1).
 4. **runtime env** — write `runtime.env` from the orchestrator secrets
    (abort on empty values, names only) + the write-bridge/read-proxy IPs
    discovered on the DAS client network.
@@ -95,8 +97,8 @@ cd deploy/openclaw-sut
    inside the SUT container (same origins the skills use).
 10. **smoke** — (a) metta runtime check: `(|- ...)` evaluates through the
     SUT metta skill with `(stv ...)` output (scratch workspace, so the
-    smoke never touches the seeded ledger); (b) skill-visibility: the six
-    benchmark skills (das-write, das-retrieve, metta, pin,
+    smoke never touches the seeded ledger); (b) skill-visibility: the five
+    benchmark skills (das-write, das-retrieve, metta,
     das-extract-knowledge, das-grounded-reasoning) appear in
     `skills list`; (c) a deployment report (no secrets).
 

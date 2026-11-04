@@ -559,8 +559,8 @@ def test_openclaw_preflight_reachability_commands():
                                                "openclaw-sut-gateway"]]
     assert any("create_connection" in " ".join(c) and "172.20.0.9" in c
                for c in probes)
-    # the six skills are probed by directory
-    for skill in ("das-write", "das-retrieve", "metta", "pin",
+    # the five skills are probed by directory
+    for skill in ("das-write", "das-retrieve", "metta",
                   "das-extract-knowledge", "das-grounded-reasoning"):
         assert ["docker", "exec", "openclaw-sut-gateway", "test", "-d",
                 f"/var/openclaw/workspace/skills/{skill}"] in commands
