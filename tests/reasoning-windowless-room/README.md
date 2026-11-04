@@ -32,7 +32,7 @@ Failure reasons are machine-readable condition codes (`A_MISSING`, `Q_NOT_IN_HIS
 - `provenance_check.py` — citation → git repo resolution chain (mirrors the bridge's write-time verify_commit, read-only)
 - `agent_prompt_template.md` — benchmark-mode prompt with the exact answers.md block format the gate parses
 - `run_benchmark.py` — orchestrator CLI (phases: preflight|setup|agent|grade|report|teardown|full; `--agent-profile omega|openclaw`)
-- `unit/` — 464 offline unit tests (stdlib shim runner: `python3 unit/run_tests.py`; includes the agent-profile seam suite `test_agent_profile.py`)
+- `unit/` — 475 offline unit tests (stdlib shim runner: `python3 unit/run_tests.py`; includes the agent-profile seam suite `test_agent_profile.py`)
 - `results/<run-id>/` — per-run artifacts (preflight/setup/agent/grade/report/teardown JSON + report.md)
 
 ## Exit Codes (the signal)
@@ -76,34 +76,60 @@ Failure reasons are machine-readable condition codes (`A_MISSING`, `Q_NOT_IN_HIS
 - v16 (single-prompt TRUE/FALSE judge): 2026-10-26 22:56 UTC directive follow-up — the judge is ONE simple prompt: test question + the Omega agent's final answer + the expected correct answer, one OpenAI-compatible chat-completions request, reply TRUE/FALSE parsed as the blocking A-gate; endpoint configurable, defaults reuse the Omega agent's ASI:One asi1-ultra and API key; preflight smoke-checks the judge. 198 offline unit tests.
 - v15 (case-set simplification + A-gate LLM judge): 2026-10-26 22:56 UTC directive — the case set is now `original`, `unsolvable`, `false` (removed `uncertainty`, `true`, `easy`, `difficult` + their prompt files; gates and the e2e procedure otherwise NOT relaxed), and answer-substance grading is ONE OpenAI chat-completions-compatible call (`llm_judge.py`: default ASI:One `https://api.asi1.ai/v1` model `asi1-ultra`, temperature 0, CORRECT/INCORRECT verdict; payload = question + ground truth + FINAL ANSWER line only — no reasoning/receipts/citations; key resolves arg > env > Omega `runtime.env`, never logged). `A_SKY`/`A_FABRICATED`/`A_NO_INABILITY` removed; `A_JUDGE_UNAVAILABLE` added (judge failure = blocking). judge tests in `unit/test_v15_judge.py`; obsolete v13 A_SKY lexicon tests removed).
 - v14 (full-provenance extraction records): 2026-10-26 22:52 UTC directive ("save also the urls, git hash, etc. — whatever is necessary to reconstruct the provenance"; wr3m close-out) — the record's `source` line previously captured only `<filename> git:<sha>`, so at answer time the agent rebuilt SOURCES sha/url pairs from memory across wake cycles (the archive receipt does not survive wakes): that gap produced wr3i's one-position sha/url pair shift, wr3m true/difficult's corrupted sha transcription (one hand-retyped hex digit → `P_UNRESOLVED:COMMIT_NOT_IN_REPO`), and wr3m easy's fabricated URL on a valid sha (`P_UNRESOLVED:URL_MISMATCH`). Prompt-side fix, gates unchanged: step 1 appends the FULL provenance line per archive (`source <filename> git:<sha> sha256:<blob> path=<repo path> <raw-github-url>`, copied verbatim from the ARCHIVE-OK receipt); the record is now the "query, answer AND SOURCES vocabulary"; step 5 extends the v12 copy-not-compose rule to SOURCES (pairs copied character-for-character from recorded `source` lines — never re-typed, never re-paired, never guessed); format-block gate rules name the record's `source` lines as the only legitimate origin of citation pairs. 193 offline unit tests (5 new v14 prompt tests in `unit/test_v14_prompt.py`; 2 pre-existing wording pins updated to the v14 contract: v10's citation-pair pin, v12's vocabulary-binding pin).
+- oc2 (OpenClaw-native shared-KB harness): 2026-11-04 22:54/22:58 UTC directive — the owner ABANDONS comparability with the Omega series and refocuses on the original objective (extract once, reason per case, strict provenance). The oc1 10-run failure analysis drove every change: (C1) the `pin` skill is DELETED (OpenClaw sessions retain conversation context across wake cycles; the pinned ledger was dead weight — the facts index / checkpoint manifest / answers.md are the durable working memory; the pin-derived `ADHERENCE_FALSE_COMPLETION` condition is removed with the channel, only the answers-file `ADHERENCE_DUPLICATE_BLOCK` check remains); (C3) `full` becomes the shared-KB flow — ONE run-level extraction (all 3 case questions as context, manifest poll, extraction log snapshot) then per-case reasoning; grade.json/report gain the shared-extraction section (manifest, receipts count, elapsed); (C4) stale-manifest archive moved to `results/<run-id>/archive-manifests/` OUTSIDE the agent-readable `knowledge-checkpoints/` (oc1a idle-trap); (C5) the stall-watchdog fresh-receipt signal reads the receipts SIDECAR lane in addition to the agent-container docker-log grep (oc1e false-abort: receipts flowed sidecar-only); (C6) per-phase session ids `wr-<run>-extract` / `wr-<run>-case-<case>` isolate phases from gateway restart-recovery zombies; (C7) prompt templates tightened and SHORTER than oc1 (word counts pinned by unit test). 475 offline unit tests.
 
 ## OpenClaw-SUT adapter (agent profile `openclaw`)
 
 The harness parameterizes the agent under test through an explicit
 `--agent-profile` seam (spec:
-[`specs/openclaw-sut-adapter/spec.md`](../../specs/openclaw-sut-adapter/spec.md)).
+[`specs/openclaw-sut-adapter/spec.md`](../../specs/openclaw-sut-adapter/spec.md);
+oc2 changes: [`specs/oc2-openclaw-native/spec.md`](../../specs/oc2-openclaw-native/spec.md)).
 The default `omega` profile keeps today's behavior byte-for-byte (the
 control arm of the comparison); the `openclaw` profile points the same
-harness at the OpenClaw-SUT gateway so a 10-run OpenClaw series can be
-compared against Omega's sks2 skill-split series. The DAS-side containers
+harness at the OpenClaw-SUT gateway. The DAS-side containers
 and the `omega-das-integration-client` network are shared by both arms.
 
 ```bash
 python3 run_benchmark.py --agent-profile openclaw preflight --run-id <run-id>
-python3 run_benchmark.py --agent-profile openclaw full --two-phase --run-id <run-id>
+python3 run_benchmark.py --agent-profile openclaw full --run-id <run-id>
 ```
 
 - **Profile flag:** `--agent-profile omega|openclaw` (default `omega`).
   `--memory-volume` defaults to the profile's volume —
   `/var/lib/docker/volumes/openclaw-sut-workspace/_data` for openclaw.
+- **oc2 run flow (`full`, shared-KB):** preflight → cleanup-das → ONE
+  run-level EXTRACTION phase (the corpus is extracted ONCE per run; the
+  prompt lists ALL THREE case questions as extraction context, never
+  per-case framing) → checkpoint-manifest poll + extraction-container
+  log snapshot (`results/<run-id>/windows/extract/phase1-docker.log`) →
+  PER CASE (`original`, `unsolvable`, `false`): reasoning-phase restart
+  → answer wait → grade → report (with the shared-extraction section:
+  manifest, receipts count, elapsed) → teardown. `--cases` limits the
+  REASONING cases (iteration mode); the shared extraction always covers
+  all three. On extraction manifest-poll timeout WITHOUT a manifest the
+  per-case reasoning still runs — each case is graded truthfully on the
+  current state, the boundary is never invented. `--two-phase` is a
+  deprecated no-op alias (the shared-KB flow IS two-phase and is the
+  default `full` path).
 - **Prompt delivery:** the harness writes the rendered `prompt.txt` into
   the workspace volume exactly as for Omega (setup-case, per-run backup,
-  standby restore unchanged) and then starts a REAL agent turn:
-  `docker exec openclaw-sut-gateway openclaw agent --message-file
-  /var/openclaw/workspace/prompt.txt --session-id wr-<run_id>-<case_id>
-  --no-color` — non-blocking; a nonzero-exit turn or a stall re-issues
-  the same delivery (the frozen prompt is idempotent for wake cycles),
-  bounded by the existing stall/phase-timeout machinery.
+  standby restore unchanged) and then starts a REAL agent turn with a
+  PER-PHASE session id (oc2 C6): `wr-<run_id>-extract` for the shared
+  extraction turn, `wr-<run_id>-case-<case_id>` for each per-case
+  reasoning turn — `docker exec openclaw-sut-gateway openclaw agent
+  --message-file /var/openclaw/workspace/prompt.txt --session-id
+  <session-id> --no-color` — non-blocking; a nonzero-exit turn or a
+  stall re-issues the same delivery (the frozen prompt is idempotent
+  for wake cycles), bounded by the existing stall/phase-timeout
+  machinery. Distinct sessions per phase keep gateway
+  restart-recovery from re-dispatching a stale phase's zombie into the
+  live phase's session.
+- **Stale-manifest hygiene (oc2 C4):** before the run-level extraction
+  installs its prompt, pre-existing checkpoint manifests are archived
+  to `results/<run-id>/archive-manifests/` (harness-side, OUTSIDE the
+  agent-readable `knowledge-checkpoints/` — the oc1a idle-trap: an
+  in-volume archive let the agent find the archived manifest and follow
+  the STOP rule) and the originals removed.
 - **Receipts census (E-gate evidence):** docker logs stay the PRIMARY
   source (same `BRIDGE-PERSIST-OK: verified=<n> top=<handle>` regex,
   same `LLMRequest[` exclusion) and are UNIONED with a receipts sidecar
@@ -113,6 +139,12 @@ python3 run_benchmark.py --agent-profile openclaw full --two-phase --run-id <run
   pairs. Rationale: OpenClaw tool stdout is not guaranteed to reach
   docker logs; the sidecar makes the census robust without touching gate
   code.
+- **Stall-watchdog forward signal (oc2 C5):** the fresh-persist-receipt
+  signal reads BOTH lanes — the agent-container docker logs FIRST, then
+  the receipts sidecar (same window semantics as the census union). The
+  oc1e false-abort class (receipts flowed in the sidecar while the
+  docker-log grep stayed silent → healthy extraction judged stalled) is
+  eliminated; omega keeps the exact historical docker-only signal.
 - **Restart semantics:** `sudo systemctl restart openclaw-sut.service`
   (the unit recreates the container: stop = `docker compose down`,
   start = `up -d`); `prompt.txt` is the openclaw profile's state file
@@ -125,11 +157,18 @@ python3 run_benchmark.py --agent-profile openclaw full --two-phase --run-id <run
   (the ASI1 key quota is shared).
 - **`--dry-run`** prints the profile-resolved plan — including the exact
   agent-turn command — without touching docker.
-- **Comparison note vs the Omega arm:** identical gates, identical frozen
-  prompt templates (rendered paths profile-mapped), identical
-  history.metta snapshot/trim/window discipline. Differences are
-  mechanical only: agent container/volume/restart unit, the
-  agent-turn delivery (vs Omega's restart-reads-prompt.txt), and the
+- **Comparison note vs the Omega arm:** identical gates and identical
+  history.metta snapshot/trim/window discipline. oc2 diverges from the
+  Omega per-case series BY DIRECTIVE (the owner abandoned comparability
+  to focus on the original objective — a reasoning agent with strict
+  provenance tracking): the extraction runs ONCE per run (shared KB
+  for all three cases), each reasoning turn is a distinct session, the
+  pin skill is gone (OpenClaw sessions retain conversation context
+  across wake cycles; the facts index / checkpoint manifest /
+  answers.md artifacts are the durable working memory), and the prompt
+  templates are shorter than the oc1 versions. Differences are
+  mechanical only: agent container/volume/restart unit, the agent-turn
+  delivery (vs Omega's restart-reads-prompt.txt), and the
   receipts-sidecar census union. Deployment of the SUT itself is
   `deploy/openclaw-sut/deploy.sh` (README there covers the env files and
   the smoke gates).

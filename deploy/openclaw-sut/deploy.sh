@@ -447,7 +447,7 @@ das lanes:        write-bridge + read-proxy reachable from the SUT
 skills:           $SUT_SKILLS (all visible)
 metta:            swipl:10.0.2 + PeTTa v1.0.4 (/opt/petta) + vendored lib_nal.metta/lib_pln.metta (/opt/sut-metta) — NAL evaluates
 secrets:          OPENAI_API_KEY/CUSTOM_API_KEY/TELEGRAM_BOT_TOKEN/OPENCLAW_GATEWAY_TOKEN present (values never printed)
-harness:          python3 tests/reasoning-windowless-room/run_benchmark.py --agent-profile openclaw full --two-phase --run-id <run-id>
+harness:          python3 tests/reasoning-windowless-room/run_benchmark.py --agent-profile openclaw full --run-id <run-id>
 [deploy] =====================================================
 REPORT
 }
