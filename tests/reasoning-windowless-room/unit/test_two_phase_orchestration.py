@@ -498,7 +498,8 @@ def _run_full_shared_kb(root, poll_found, manifest_names=("corpus.md",),
                      "setup_extraction_phase", "setup_reasoning_phase",
                      "_poll_checkpoint_manifest", "_snapshot_phase1_logs",
                      "agent_case", "grade_case", "_copy_window_artifacts",
-                     "report", "teardown", "_load_json", "_write_json")
+                     "_census_persist_receipts", "report", "teardown",
+                     "_load_json", "_write_json")
     }
     order = []
 
@@ -547,6 +548,9 @@ def _run_full_shared_kb(root, poll_found, manifest_names=("corpus.md",),
             rb.agent_case = rec("agent-case")
             rb.grade_case = rec("grade-case")
             rb._copy_window_artifacts = rec("copy-windows")
+            rb._census_persist_receipts = (
+                lambda since, until, profile=None, memory_volume=None,
+                extra_logs="": {"count": 7, "matched": []})
             rb.report = rec("report")
             rb.teardown = rec("teardown")
             rb._load_json = lambda path: grade_stub.get(
@@ -589,6 +593,9 @@ def test_full_shared_kb_happy_path_ordering():
     assert shared["manifest_found"] is True
     assert shared["manifests"] == ["corpus.md"]
     assert shared["manifest_poll_elapsed_s"] == 42
+    # oc2 C3: the receipts count is recorded (live census persisted
+    # before the extraction container dies)
+    assert shared["persist_receipts"] == 7
     assert rc == rb.GATE_PASS
 
 
@@ -700,6 +707,39 @@ def test_poll_stall_does_not_fire_while_receipts_flow():
         out = rb._poll_checkpoint_manifest(
             _args(), "2026-11-02T10:00:00Z", timeout_s=0.3,
             interval_s=0.01, _sleep=lambda s: None, stall_minutes=0.002)
+        assert out["found"] is False
+        assert out["stall_aborted"] is False
+    finally:
+        rb._manifest_census = saved_census
+        rb._sudo_read = saved_read
+        rb._docker_logs_since = saved_logs
+
+
+def test_poll_stall_does_not_fire_while_sidecar_receipts_flow():
+    """oc2 C5 (oc1e RCA): the oc1 stall watchdog read ONLY the agent
+    container's docker logs for the fresh-receipt forward signal; under
+    OpenClaw the receipts durably land in the write-bridge receipts
+    SIDECAR (benchmark/persist-receipts.log) — a docker-silent but
+    sidecar-flowing extraction is HEALTHY and must not abort (the oc1e
+    false-abort class). Docker lane EMPTY, fixture receipt line in the
+    sidecar lane only."""
+    fresh = rb._now_iso_minus_seconds(30)
+    fixture = (f"{fresh} BRIDGE-PERSIST-OK: verified=1 "
+               f"top={'e' * 32}\n")
+    saved_census = rb._manifest_census
+    saved_read = rb._sudo_read
+    saved_logs = rb._docker_logs_since
+    rb._manifest_census = lambda args: []
+    rb._docker_logs_since = lambda c, a, b: ""  # the oc1e blind spot
+    rb._sudo_read = lambda p: (fixture
+                               if str(p).endswith(
+                                   "benchmark/persist-receipts.log")
+                               else "")
+    try:
+        out = rb._poll_checkpoint_manifest(
+            _args(agent_profile="openclaw"), "2026-11-02T10:00:00Z",
+            timeout_s=0.3, interval_s=0.01, _sleep=lambda s: None,
+            stall_minutes=0.002)
         assert out["found"] is False
         assert out["stall_aborted"] is False
     finally:

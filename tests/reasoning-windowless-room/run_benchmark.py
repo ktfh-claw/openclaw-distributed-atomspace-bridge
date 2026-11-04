@@ -539,6 +539,48 @@ def _union_receipt_census(docker_matched: list[str], sidecar_text: str,
     return out
 
 
+def _recent_persist_signal(profile: AgentProfile, window_s: float,
+                           memory_volume: str | None = None) -> bool:
+    """oc2 C5 (oc1e RCA): is there a persist receipt within the last
+    ``window_s`` seconds, in EITHER forward-signal lane?
+
+    The oc1 stall watchdog's "fresh persist receipt" signal read ONLY the
+    agent container's docker logs; under OpenClaw the receipts durably
+    land in the write-bridge receipts SIDECAR
+    (<memory-volume>/benchmark/persist-receipts.log — the das-write
+    skill appends one ISO-8601-prefixed line per success; OpenClaw tool
+    stdout is not guaranteed to reach docker logs), so a healthy
+    extraction was judged stalled (oc1e: receipts flowed in the sidecar
+    while the docker-log grep stayed silent).
+
+    The docker-log lane stays FIRST (additive, not a replacement — spec
+    C5); the sidecar lane is timestamp-windowed with the same
+    [since, now] semantics as the E_NO_INGEST census union. Errors in
+    either lane are not gate evidence: False only when NEITHER lane
+    shows a fresh receipt."""
+    since_iso = _now_iso_minus_seconds(window_s)
+    try:
+        recent = _docker_logs_since(profile.container_agent, since_iso,
+                                    _now_iso())
+        if PERSIST_RECEIPT_RE.search(recent):
+            return True
+    except Exception:
+        pass  # docker-log errors are not gate evidence
+    if profile.uses_receipts_sidecar and memory_volume:
+        sidecar_text = _sudo_read(
+            Path(memory_volume) / RECEIPTS_SIDECAR_REL) or ""
+        since_dt = _parse_iso_utc(since_iso)
+        if since_dt is not None:
+            for raw in sidecar_text.splitlines():
+                m = SIDECAR_RECEIPT_RE.match(raw.strip())
+                if m is None:
+                    continue
+                ts = _parse_iso_utc(m.group(1))
+                if ts is not None and ts >= since_dt:
+                    return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # L1 deltas (Balázs directive 2026-10-30 23:50 UTC): state-vs-claim
 # adherence cross-checks (1), layer-split verdict fields (2), stall
@@ -2219,16 +2261,12 @@ def _poll_checkpoint_manifest(args, since_iso: str,
             if facts_now != facts_state:
                 facts_state = facts_now
                 last_signal = time.time()
-            else:
-                try:
-                    recent = _docker_logs_since(
-                        profile.container_agent,
-                        _now_iso_minus_seconds(max(120.0, interval_s * 4)),
-                        _now_iso())
-                    if PERSIST_RECEIPT_RE.search(recent):
-                        last_signal = time.time()
-                except Exception:
-                    pass  # docker-log errors are not gate evidence
+            elif _recent_persist_signal(
+                    profile, max(120.0, interval_s * 4),
+                    _memory_volume(args)):
+                # oc2 C5: the fresh-receipt signal reads the receipts
+                # SIDECAR in addition to the agent-container docker logs
+                last_signal = time.time()
             if time.time() - last_signal >= stall_s:
                 # R-A2 (openclaw): a phase-1 stall re-issues the delivery
                 # turn (the frozen prompt is idempotent) and keeps polling;
@@ -2387,7 +2425,8 @@ def agent_case(args) -> int:
         # delta 3 (Balázs directive 22:54 UTC): a healthy case moves in
         # ~10-15 min; a long silent stretch is a stall to investigate
         # early, not wait out. Forward signals: new answers.md content,
-        # new facts-index.md content, or a fresh persist receipt.
+        # new facts-index.md content, or a fresh persist receipt (oc2
+        # C5: docker logs OR the receipts sidecar).
         moved = False
         if content is not None and content != answers_state:
             answers_state = content
@@ -2396,14 +2435,8 @@ def agent_case(args) -> int:
         if facts_now != facts_state:
             facts_state = facts_now
             moved = True
-        try:
-            recent = _docker_logs_since(profile.container_agent,
-                                        _now_iso_minus_seconds(120),
-                                        _now_iso())
-            if PERSIST_RECEIPT_RE.search(recent):
-                moved = True
-        except Exception:
-            pass  # docker-log errors are not gate evidence
+        if _recent_persist_signal(profile, 120, _memory_volume(args)):
+            moved = True
         watchdog.register(moved, time.time())
         if watchdog.should_abort(time.time()):
             elapsed = int(time.time() - start)
@@ -2992,6 +3025,19 @@ def full_shared_kb(args) -> int:
                 "phase1_snapshot": snap.get("path"),
                 "extraction_restarted_at": since_iso,
             }
+            # oc2 C3: receipts count for the shared extraction window,
+            # persisted HERE — the live census is the only valid read
+            # (the extraction container is rm'd at the first reasoning
+            # restart; a retroactive re-census would see zero). The
+            # receipts lane is the docker-logs ∪ sidecar union (C5).
+            receipt_census = _census_persist_receipts(
+                since_iso, _now_iso(),
+                profile=_profile(args), memory_volume=_memory_volume(args))
+            shared_extraction["persist_receipts"] = \
+                receipt_census.get("count", 0)
+            _write_json(RESULTS_DIR / args.run_id
+                        / f"persist-receipts-{EXTRACT_PSEUDO_CASE}.json",
+                        receipt_census)
             if not poll["found"]:
                 print("[full] no checkpoint manifest from the shared "
                       "extraction — proceeding to per-case reasoning "
@@ -3259,6 +3305,7 @@ def report(args) -> int:
                      f"{'found' if shared.get('manifest_found') else 'NOT found'}"
                      + (f" ({', '.join(shared.get('manifests', []))})"
                         if shared.get("manifests") else "")
+                     + f", receipts {shared.get('persist_receipts', '?')}"
                      + f", poll elapsed {shared.get('manifest_poll_elapsed_s', '?')}s")
 
     lines.append("")
