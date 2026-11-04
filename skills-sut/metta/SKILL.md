@@ -23,7 +23,7 @@ description: >-
   chain multi-step reasoning by feeding the derived output of one call in
   as a premise of the next call. Quote interpreter output verbatim
   including (stv ...) as your evidence. Tool results are gone next
-  cycle: immediately pin or write-file every successful derivation you
+  cycle: immediately write-file every successful derivation you
   must keep. On syntax_error read the offending form, fix the shape
   (almost always argument count or arity), retry once; never retry more
   than twice.
@@ -59,7 +59,7 @@ their `(stv strength confidence)` truth values — quote it verbatim
 The atomspace is EPHEMERAL between calls — nothing persists across
 invocations. Chain multi-step reasoning by feeding the derived output of
 one call in as a premise of the next call. Tool results are gone next
-cycle: immediately pin or write-file every successful derivation you
+cycle: immediately write-file every successful derivation you
 must keep.
 
 ## Syntax errors
