@@ -222,21 +222,38 @@ def test_agent_restart_profile_routing():
 # ---------------------------------------------------------------------------
 
 def test_delivery_command_exact_argv():
-    cmd = rb._delivery_command(_args(agent_profile="openclaw"), "false")
+    cmd = rb._delivery_command(_args(agent_profile="openclaw"), "case-false")
     assert cmd == [
         "docker", "exec", "openclaw-sut-gateway",
         "openclaw", "agent",
         "--message-file", "/var/openclaw/workspace/prompt.txt",
-        "--session-id", "wr-t-run-false",
+        "--session-id", "wr-t-run-case-false",
         "--no-color",
     ]
 
 
 def test_delivery_command_session_id_format():
-    cmd = rb._delivery_command(
-        _args(agent_profile="openclaw", run_id="20261103-101530"),
-        "unsolvable")
-    assert cmd[cmd.index("--session-id") + 1] == "wr-20261103-101530-unsolvable"
+    """oc2 C6: per-phase session ids — wr-<run>-extract for the shared
+    extraction turn, wr-<run>-case-<case> for each reasoning turn."""
+    args = _args(agent_profile="openclaw", run_id="20261103-101530")
+    extract = rb._delivery_command(args, rb._delivery_session_key(
+        args.case, "extraction"))
+    assert extract[extract.index("--session-id") + 1] == \
+        "wr-20261103-101530-extract"
+    reason = rb._delivery_command(args, rb._delivery_session_key(
+        "unsolvable", "reasoning"))
+    assert reason[reason.index("--session-id") + 1] == \
+        "wr-20261103-101530-case-unsolvable"
+
+
+def test_delivery_session_key_per_phase():
+    """oc2 C6: the extraction session key is the bare pseudo-key 'extract'
+    (no case); the reasoning session key is 'case-<case_id>' — distinct
+    sessions per phase, so gateway restart-recovery cannot re-dispatch a
+    stale phase's zombie into the live phase's session."""
+    assert rb._delivery_session_key("extract", "extraction") == "extract"
+    assert rb._delivery_session_key("original", "reasoning") == "case-original"
+    assert rb._delivery_session_key("original", None) == "case-original"
 
 
 def test_delivery_command_empty_for_omega():
@@ -610,9 +627,21 @@ def test_openclaw_setup_case_dry_run_prints_delivery_command():
         rc = rb.setup_case(_args(agent_profile="openclaw", dry_run=True))
     assert rc == 0
     out = buf.getvalue()
+    # oc2 C6: the standalone (phase=None) turn targets the case session
     assert ("docker exec openclaw-sut-gateway openclaw agent "
             "--message-file /var/openclaw/workspace/prompt.txt "
-            "--session-id wr-t-run-original --no-color") in out
+            "--session-id wr-t-run-case-original --no-color") in out
+
+
+def test_openclaw_setup_extraction_dry_run_prints_extract_session():
+    """oc2 C6: the extraction-phase dry-run shows the run-level session
+    key 'extract' (distinct from any case-<case> reasoning session)."""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = rb.setup_case(_args(agent_profile="openclaw", dry_run=True),
+                           phase="extraction")
+    assert rc == 0
+    assert "--session-id wr-t-run-extract --no-color" in buf.getvalue()
 
 
 def test_omega_setup_case_dry_run_prints_exactly_the_old_plan():
@@ -745,8 +774,9 @@ def test_openclaw_setup_case_flow_against_fake_volume():
     assert files["/oc-vol/history.metta"] == rb._trim_marker("t-run",
                                                              "original")
     # restart via the openclaw unit + delivery turn started after it
+    # (oc2 C6: the session key is per-phase — 'case-original' here)
     assert restarts == ["openclaw"]
-    assert deliveries == ["original"]
+    assert deliveries == ["case-original"]
     # the openclaw per-case chown keeps agent-writable ownership
     assert any(c[0] == "chown" and "1000:1000" in c for c in calls)
 

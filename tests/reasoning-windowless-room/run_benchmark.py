@@ -1666,7 +1666,7 @@ def _agent_restart(profile: AgentProfile | None = None) -> bool:
 # prompt.txt into the memory volume exactly as today AND then starts a real
 # agent turn inside the SUT gateway container:
 #   docker exec <container_agent> openclaw agent --message-file <abs-in-container
-#   prompt.txt path> --session-id wr-<run_id>-<case_id> --no-color
+#   prompt.txt path> --session-id wr-<run_id>-<session_key> --no-color
 # (flags verified against the pinned image's documented CLI surface:
 # openclaw agent --message-file / --session-id exist; --no-color is a global
 # CLI flag — docs.openclaw.ai/cli/agent, /cli). The turn is non-blocking and
@@ -1675,15 +1675,33 @@ def _agent_restart(profile: AgentProfile | None = None) -> bool:
 # exit or on a stall-window without the answer block, at most one re-issue
 # per stall window, the case/phase wall-clock cap bounds the total. No new
 # policy: the frozen prompt is idempotent for wake cycles by design.
+#
+# oc2 C6 (per-phase session identity): the session key is per-PHASE —
+# ``extract`` for the run-level extraction turn, ``case-<case_id>`` for
+# each per-case reasoning turn — so gateway restart-recovery cannot
+# re-dispatch a stale phase's zombie into the live phase's session.
 # ---------------------------------------------------------------------------
 
 _DELIVERY_PROCS: dict[tuple[str, str], dict] = {}
 
 
-def _delivery_command(args, case_id: str) -> list[str]:
-    """R-A2: the agent-turn delivery command as ONE testable unit (exact
-    argv, session-id format wr-<run_id>-<case_id>). Empty for the omega
-    profile (restart-only delivery — the prompt is read at agent start)."""
+def _delivery_session_key(case_id: str, phase: str | None = None) -> str:
+    """oc2 C6: the per-phase delivery session key. The run-level
+    extraction turn targets ``extract`` (no case — the shared KB
+    extraction); each per-case reasoning turn targets ``case-<case_id>``
+    — distinct sessions, so gateway restart-recovery cannot re-dispatch
+    a stale phase's zombie into the live phase's session."""
+    if phase == "extraction":
+        return "extract"
+    return f"case-{case_id}"
+
+
+def _delivery_command(args, session_key: str) -> list[str]:
+    """R-A2 + oc2 C6: the agent-turn delivery command as ONE testable
+    unit (exact argv, session-id format wr-<run_id>-<session_key>; the
+    session key is per-phase — see _delivery_session_key). Empty for the
+    omega profile (restart-only delivery — the prompt is read at agent
+    start)."""
     profile = _profile(args)
     if profile.prompt_abs_in_container is None:
         return []
@@ -1691,7 +1709,7 @@ def _delivery_command(args, case_id: str) -> list[str]:
         "docker", "exec", profile.container_agent,
         "openclaw", "agent",
         "--message-file", profile.prompt_abs_in_container,
-        "--session-id", f"wr-{args.run_id}-{case_id}",
+        "--session-id", f"wr-{args.run_id}-{session_key}",
         "--no-color",
     ]
 
@@ -1721,14 +1739,14 @@ def _wait_for_gateway_ready(profile, timeout_s: float = 180.0,
     return False
 
 
-def _start_agent_turn(args, case_id: str) -> bool:
+def _start_agent_turn(args, session_key: str) -> bool:
     """Start the delivery turn (non-blocking Popen, output discarded — the
     gateway container's own logs carry the turn transcript; the receipts
     sidecar covers census robustness)."""
     profile = _profile(args)
     if not profile.delivers_agent_turn:
         return True
-    cmd = _delivery_command(args, case_id)
+    cmd = _delivery_command(args, session_key)
     if getattr(args, "dry_run", False):
         print(f"[delivery] [dry-run] would start the agent turn: "
               f"{shlex.join(cmd)}")
@@ -1739,40 +1757,40 @@ def _start_agent_turn(args, case_id: str) -> bool:
     # answer before starting the turn.
     if not _wait_for_gateway_ready(profile):
         print(f"[delivery] ERROR: gateway not ready after wait "
-              f"(case {case_id})")
+              f"(session {session_key})")
         return False
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
     except OSError as e:
         print(f"[delivery] ERROR: could not start the agent turn "
-              f"(case {case_id}): {e}")
+              f"(session {session_key}): {e}")
         return False
-    key = (args.run_id, case_id)
+    key = (args.run_id, session_key)
     prior = _DELIVERY_PROCS.get(key)
     _DELIVERY_PROCS[key] = {
         "proc": proc, "argv": cmd,
         "issues": (prior["issues"] + 1) if prior else 1,
         "last_reissue": (prior or {}).get("last_reissue", 0.0),
     }
-    print(f"[delivery] agent turn started (session wr-{args.run_id}-{case_id})")
+    print(f"[delivery] agent turn started (session wr-{args.run_id}-{session_key})")
     return True
 
 
-def _reissue_agent_turn(args, case_id: str) -> bool:
+def _reissue_agent_turn(args, session_key: str) -> bool:
     """Re-issue the same delivery (idempotent prompt): kill a still-running
     turn first — a hung turn plus a fresh one would double-answer."""
-    key = (args.run_id, case_id)
+    key = (args.run_id, session_key)
     rec = _DELIVERY_PROCS.get(key)
     if rec is not None and rec["proc"].poll() is None:
         try:
             rec["proc"].kill()
         except OSError:
             pass
-    return _start_agent_turn(args, case_id)
+    return _start_agent_turn(args, session_key)
 
 
-def _maybe_reissue_delivery(args, case_id: str, stall_seconds: float,
+def _maybe_reissue_delivery(args, session_key: str, stall_seconds: float,
                             reason: str) -> bool:
     """The R-A2 re-issue gate shared by both wait loops: at most ONE
     re-issue per stall window (the existing watchdog cadence); the case /
@@ -1781,13 +1799,13 @@ def _maybe_reissue_delivery(args, case_id: str, stall_seconds: float,
     profile = _profile(args)
     if not profile.delivers_agent_turn or getattr(args, "dry_run", False):
         return False
-    key = (args.run_id, case_id)
+    key = (args.run_id, session_key)
     rec = _DELIVERY_PROCS.get(key)
     now = time.time()
     if (rec is not None and stall_seconds > 0
             and now - rec.get("last_reissue", 0.0) < stall_seconds):
         return False  # this stall window already re-issued
-    ok = _reissue_agent_turn(args, case_id)
+    ok = _reissue_agent_turn(args, session_key)
     if ok and key in _DELIVERY_PROCS:
         _DELIVERY_PROCS[key]["last_reissue"] = now
     if ok:
@@ -1795,18 +1813,18 @@ def _maybe_reissue_delivery(args, case_id: str, stall_seconds: float,
     return ok
 
 
-def _delivery_exit(args, case_id: str) -> int | None:
+def _delivery_exit(args, session_key: str) -> int | None:
     """The delivery turn's exit code, None while still running (or absent)."""
-    rec = _DELIVERY_PROCS.get((args.run_id, case_id))
+    rec = _DELIVERY_PROCS.get((args.run_id, session_key))
     if rec is None:
         return None
     return rec["proc"].poll()
 
 
-def _stop_agent_turn(args, case_id: str) -> None:
+def _stop_agent_turn(args, session_key: str) -> None:
     """Best-effort stop of the delivery turn (case complete or timed out —
     a lingering duplicate turn must not keep consuming the shared quota)."""
-    rec = _DELIVERY_PROCS.pop((args.run_id, case_id), None)
+    rec = _DELIVERY_PROCS.pop((args.run_id, session_key), None)
     if rec is None:
         return
     if rec["proc"].poll() is None:
@@ -1843,10 +1861,18 @@ def setup_case(args, phase: str = None) -> int:
     _delivery_command); the frozen prompt is delivered per phase.
     """
     profile = _profile(args)
-    case = _case_by_id(args.case)
-    if case is None:
-        print(f"[setup-case] ERROR: unknown case id {args.case}")
-        return GATE_ERROR
+    if phase == "extraction":
+        # oc2 C3: the run-level SHARED extraction — no specific case; the
+        # prompt carries ALL case questions ({{ALL_QUESTIONS}}). args.case
+        # is the pseudo-case id ("extract") used for snapshot/record
+        # naming only; the case dict is not needed (the shared template
+        # renderer ignores it).
+        case = None
+    else:
+        case = _case_by_id(args.case)
+        if case is None:
+            print(f"[setup-case] ERROR: unknown case id {args.case}")
+            return GATE_ERROR
     paths = _bench_paths(args)
     facts_mod = _facts_mod()
 
@@ -1859,11 +1885,15 @@ def setup_case(args, phase: str = None) -> int:
                 + ", restart agent")
         if profile.delivers_agent_turn:
             plan += (f", then start the agent turn: "
-                     f"{shlex.join(_delivery_command(args, args.case))}")
+                     f"{shlex.join(_delivery_command(args, _delivery_session_key(args.case, phase)))}")
         print(plan)
         return 0
 
-    first = args.case == facts_mod.TEST_CASES[0]["id"]
+    if phase == "extraction":
+        # oc2 C3: the run-level extraction is ALWAYS the run start
+        first = True
+    else:
+        first = args.case == facts_mod.TEST_CASES[0]["id"]
     _prepare_benchmark_dir(args)
 
     # v4: run-start initialization happens on THIS RUN's first setup-case,
@@ -1990,8 +2020,10 @@ def setup_case(args, phase: str = None) -> int:
 
     # R-A2 (openclaw): the prompt file is in place and the (fresh) gateway
     # container is up — deliver the real agent turn (non-blocking; the wait
-    # loops manage it under the existing stall/timeout machinery)
-    if profile.delivers_agent_turn and not _start_agent_turn(args, args.case):
+    # loops manage it under the existing stall/timeout machinery).
+    # oc2 C6: the session key is per-phase (extract / case-<case>).
+    if profile.delivers_agent_turn and not _start_agent_turn(
+            args, _delivery_session_key(args.case, phase)):
         print(f"[setup-case] ERROR: agent-turn delivery failed to start "
               f"(case {args.case})")
         return GATE_ERROR
@@ -2039,6 +2071,10 @@ def setup_case(args, phase: str = None) -> int:
 # ---------------------------------------------------------------------------
 
 CHECKPOINT_DIR_REL = "knowledge-checkpoints"
+# oc2 C3: the pseudo-case id for the RUN-LEVEL shared extraction phase
+# (snapshot/record naming: setup-extraction-case-extract.json,
+# windows/extract/phase1-docker.log). Not a real TEST_CASES id.
+EXTRACT_PSEUDO_CASE = "extract"
 MANIFEST_POLL_INTERVAL_S = 30.0
 
 PHASE1_LOG_BASENAME = "phase1-docker.log"
@@ -2071,19 +2107,23 @@ def _manifest_census(args) -> list[dict]:
 
 
 def _sweep_stale_manifests(args) -> list[str]:
-    """v2 phase-1 hygiene: archive pre-existing checkpoint manifests out
-    of knowledge-checkpoints/ before a case's EXTRACTION phase installs
-    its prompt.
+    """oc2 C4: archive pre-existing checkpoint manifests to a HARNESS-SIDE
+    path OUTSIDE the agent workspace (results/<run-id>/archive-manifests/)
+    before the run-level EXTRACTION phase installs its prompt.
 
     A stale manifest (left over from a previous/aborted run) makes the
     extraction agent's STOP rule fire on its FIRST wake cycle (the
     extraction prompt says a wake cycle that finds the manifest already
     written must do NOTHING) — the phase-1 boundary poll then never sees
-    a fresh manifest and the case degrades to grade-as-is with phase 2
-    skipped. The sweep moves every *.md in the checkpoint dir into an
-    in-volume archive subdir (kept for provenance, never deleted) so
-    each phase 1 starts from an empty boundary namespace. Same hygiene
-    class as cleanup-das: infra state hygiene, NOT a gate change.
+    a fresh manifest and the run degrades to grade-as-is. The sweep
+    copies every *.md in the checkpoint dir into the harness-side
+    archive (kept for provenance, never deleted) and removes the
+    originals from the agent-readable knowledge-checkpoints/ dir.
+
+    oc1a idle-trap lesson (spec C4): the archive must NEVER live inside
+    the agent-readable knowledge-checkpoints/ dir — the oc1a agent found
+    the archived manifest, followed the STOP rule ("manifest already
+    written → do nothing"), and never extracted.
 
     Returns the sorted list of archived manifest names (empty when the
     dir was already clean). Raises RuntimeError on any archive failure —
@@ -2094,19 +2134,21 @@ def _sweep_stale_manifests(args) -> list[str]:
     names = sorted(m["name"] for m in _manifest_census(args))
     if not names:
         return []
-    archive = ckpt / f".archive-pre-{args.run_id}"
-    r = _sudo_run(["mkdir", "-p", str(archive)])
-    if r.returncode != 0:
-        raise RuntimeError(f"archive mkdir failed: {archive}")
+    archive = RESULTS_DIR / args.run_id / "archive-manifests"
+    archive.mkdir(parents=True, exist_ok=True)
     for n in names:
-        r = _sudo_run(["mv", str(ckpt / n), str(archive / n)])
+        content = _sudo_read(ckpt / n)
+        if content is None:
+            raise RuntimeError(f"manifest archive read failed: {n}")
+        (archive / n).write_text(content, encoding="utf-8")
+        r = _sudo_run(["rm", "-f", str(ckpt / n)])
         if r.returncode != 0:
-            raise RuntimeError(f"manifest archive mv failed: {n}")
+            raise RuntimeError(f"manifest archive rm failed: {n}")
     left = sorted(m["name"] for m in _manifest_census(args))
     if left:
         raise RuntimeError(f"manifest sweep incomplete; still present: {left}")
     print(f"[setup-case] archived {len(names)} stale checkpoint manifest(s) "
-          f"to {archive.name}/ (phase-1 boundary namespace cleared)")
+          f"to {archive}/ (harness-side, phase-1 boundary namespace cleared)")
     return names
 
 
@@ -2153,11 +2195,13 @@ def _poll_checkpoint_manifest(args, since_iso: str,
     while time.time() - start < timeout_s:
         if profile.delivers_agent_turn:
             # R-A2 re-issue trigger: a delivery turn that exited nonzero
-            # re-issues (rate-limited by the stall window below)
-            delivery_rc = _delivery_exit(args, args.case)
+            # re-issues (rate-limited by the stall window below). oc2 C6:
+            # the manifest poll runs in the EXTRACTION phase — the
+            # delivery session key is 'extract'.
+            delivery_rc = _delivery_exit(args, "extract")
             if delivery_rc is not None and delivery_rc != 0:
                 _maybe_reissue_delivery(
-                    args, args.case, stall_s,
+                    args, "extract", stall_s,
                     f"delivery turn exited {delivery_rc}")
         for m in _manifest_census(args):
             if m["mtime"] >= since_epoch and m["name"] not in found:
@@ -2191,7 +2235,7 @@ def _poll_checkpoint_manifest(args, since_iso: str,
                 # the PHASE TIMEOUT stays the bound and the abort/grade-
                 # as-is semantics are unchanged for a stall that persists
                 # past it. omega keeps the existing early-abort.
-                if _maybe_reissue_delivery(args, args.case, stall_s,
+                if _maybe_reissue_delivery(args, "extract", stall_s,
                                            "phase-1 stall"):
                     last_signal = time.time()
                 else:
@@ -2307,7 +2351,7 @@ def agent_case(args) -> int:
         if profile.delivers_agent_turn:
             print(f"[agent-case] [dry-run] would manage the delivery turn "
                   f"(re-issue on nonzero exit or stall): "
-                  f"{shlex.join(_delivery_command(args, args.case))}")
+                  f"{shlex.join(_delivery_command(args, _delivery_session_key(args.case)))}")
         return 0
 
     stall_minutes = getattr(args, "stall_minutes", DEFAULT_STALL_MINUTES)
@@ -2321,8 +2365,9 @@ def agent_case(args) -> int:
             post = paths["vol"] / f"history.post-case-{args.run_id}-{args.case}.metta"
             _sudo_run(["cp", str(paths["history"]), str(post)])
             # R-A2: the answer block exists — stop any lingering duplicate
-            # delivery turn (it must not keep consuming the shared quota)
-            _stop_agent_turn(args, args.case)
+            # delivery turn (it must not keep consuming the shared quota).
+            # oc2 C6: the reasoning turn's session key.
+            _stop_agent_turn(args, _delivery_session_key(args.case))
             elapsed = int(time.time() - start)
             print(f"[agent-case] case {args.case} answered after {elapsed}s")
             _write_json(RESULTS_DIR / args.run_id / f"agent-case-{args.case}.json", {
@@ -2334,10 +2379,10 @@ def agent_case(args) -> int:
         # nonzero without the answer block re-issues (rate-limited by the
         # stall window — the existing machinery)
         if profile.delivers_agent_turn:
-            delivery_rc = _delivery_exit(args, args.case)
+            delivery_rc = _delivery_exit(args, _delivery_session_key(args.case))
             if delivery_rc is not None and delivery_rc != 0:
                 _maybe_reissue_delivery(
-                    args, args.case, stall_minutes * 60,
+                    args, _delivery_session_key(args.case), stall_minutes * 60,
                     f"delivery turn exited {delivery_rc}")
         # delta 3 (Balázs directive 22:54 UTC): a healthy case moves in
         # ~10-15 min; a long silent stretch is a stall to investigate
@@ -2368,7 +2413,7 @@ def agent_case(args) -> int:
                 # is idempotent for wake cycles by design); the case
                 # wall-clock cap (existing machinery) stays the backstop.
                 if _maybe_reissue_delivery(
-                        args, args.case, stall_minutes * 60,
+                        args, _delivery_session_key(args.case), stall_minutes * 60,
                         f"stall: no forward signal for {stall_minutes}m"):
                     watchdog.register(True, time.time())
                     time.sleep(30)
@@ -2376,7 +2421,7 @@ def agent_case(args) -> int:
             print(f"[agent-case] STALL WATCHDOG: case {args.case} had no "
                   f"forward signal for {stall_minutes}m (elapsed {elapsed}s)"
                   " — aborting case for early investigation")
-            _stop_agent_turn(args, args.case)
+            _stop_agent_turn(args, _delivery_session_key(args.case))
             post = paths["vol"] / f"history.post-case-{args.run_id}-{args.case}.metta"
             _sudo_run(["cp", str(paths["history"]), str(post)])
             _write_json(RESULTS_DIR / args.run_id / f"agent-case-{args.case}.json", {
@@ -2387,7 +2432,7 @@ def agent_case(args) -> int:
             return 1
         time.sleep(30)
 
-    _stop_agent_turn(args, args.case)
+    _stop_agent_turn(args, _delivery_session_key(args.case))
     post = paths["vol"] / f"history.post-case-{args.run_id}-{args.case}.metta"
     _sudo_run(["cp", str(paths["history"]), str(post)])
     print(f"[agent-case] TIMEOUT on case {args.case}")
@@ -2606,17 +2651,19 @@ def grade_case(args) -> int:
     # this durable, live-only evidence BEFORE the reconstruction lane.  A
     # reconstruction harness failure must not discard the agent container's
     # per-instance logs; after a restart they cannot be recovered.
-    # v2 two-phase wiring: the CASE window starts at the PHASE-1 restart
-    # (setup-case JSON keeps it); the live container only carries the
-    # PHASE-2 logs (the phase-1 container was rm'd at the phase-2
-    # restart), so phase-1 evidence is read from the phase1-docker.log
-    # snapshot (results/<run-id>/windows/<case>/) and merged into the
-    # census. The Q-gate attestation lane reads the PERSISTENT read-proxy
-    # / query-engine logs, which survive agent restarts, so it keeps the
-    # full case window [phase-1 restart, now].
-    setup_json = _load_json(rd / f"setup-case-{args.case}.json") or {}
+    # oc2 C3 wiring: the CASE window starts at the RUN-LEVEL EXTRACTION
+    # restart (setup-case-extract.json keeps it); the live container only
+    # carries the REASONING logs (the extraction container was rm'd at the
+    # first reasoning restart), so extraction evidence is read from the
+    # phase1-docker.log snapshot (results/<run-id>/windows/extract/) and
+    # merged into the census. The Q-gate attestation lane reads the
+    # PERSISTENT read-proxy / query-engine logs, which survive agent
+    # restarts, so it keeps the full case window [extraction restart, now].
+    setup_json = (_load_json(
+        rd / f"setup-case-{EXTRACT_PSEUDO_CASE}.json")
+        or _load_json(rd / f"setup-case-{args.case}.json") or {})
     since_iso = setup_json.get("restarted_at") or _now_iso()
-    phase1_log_path = rd / "windows" / args.case / PHASE1_LOG_BASENAME
+    phase1_log_path = rd / "windows" / EXTRACT_PSEUDO_CASE / PHASE1_LOG_BASENAME
     phase1_logs = ""
     if phase1_log_path.is_file():
         try:
@@ -2742,9 +2789,10 @@ def teardown(args) -> int:
               "restart, optionally remove per-case volume snapshots")
         return 0
 
-    # R-A2: any lingering delivery turn of this run is stopped (best-effort)
-    for (run_id, case_id) in [k for k in _DELIVERY_PROCS if k[0] == args.run_id]:
-        _stop_agent_turn(args, case_id)
+    # R-A2: any lingering delivery turn of this run is stopped (best-effort).
+    # oc2 C6: the dict key's second element IS the per-phase session key.
+    for (run_id, session_key) in [k for k in _DELIVERY_PROCS if k[0] == args.run_id]:
+        _stop_agent_turn(args, session_key)
 
     try:
         backup_prompt = paths["vol"] / f"prompt.txt.bak-pre-benchmark-{args.run_id}"
@@ -2848,12 +2896,33 @@ def _copy_window_artifacts(args, case_id: str) -> None:
             _sudo_run(["cp", str(src), str(rd / f"pre-{phase}.metta")])
 
 
-def full_sequential(args) -> int:
-    """v3 default: preflight -> cleanup-das -> per case (setup/agent/grade,
-    independent) -> report -> teardown (always).
+def full_shared_kb(args) -> int:
+    """oc2 C3 (shared one-time KB extraction, owner directive
+    2026-11-04): preflight -> cleanup-das -> ONE run-level EXTRACTION
+    phase (extract the corpus ONCE, persist, write manifest + facts
+    index; the prompt lists ALL THREE case questions as context) ->
+    phase-1 log snapshot -> PER CASE (original, unsolvable, false):
+    reasoning-phase restart (fresh per-case session) -> answer wait ->
+    grade -> report (with a shared-extraction section) -> teardown.
 
-    --cases limits the sequence to a subset (e.g. "original,false") —
-    the iteration mode: relaunch only the cases under test.
+    The run-level extraction replaces the oc1 per-case extraction (3x
+    the stall exposure, 3x the quota burn, and the shared-DB state
+    meant later cases found receipts "already present" and idled).
+    Per-case phase-1 hygiene (stale-manifest sweep) applies ONCE per
+    run, at the run-level extraction. The per-case reasoning phases use
+    per-phase session ids (oc2 C6: wr-<run>-extract for the extraction
+    turn, wr-<run>-case-<case> for each reasoning turn) so gateway
+    restart-recovery zombies cannot leak across phases.
+
+    On extraction manifest-poll timeout WITHOUT a manifest the run
+    still proceeds to the per-case reasoning (the harness never
+    invents a boundary — each case is graded truthfully on the current
+    state; the missing manifest is recorded in the shared-extraction
+    section).
+
+    --cases limits the REASONING sequence to a subset (iteration mode);
+    the shared extraction always covers all cases (the KB must be
+    sufficient for all three).
     """
     facts_mod = _facts_mod()
     all_ids = [c["id"] for c in facts_mod.TEST_CASES]
@@ -2861,10 +2930,11 @@ def full_sequential(args) -> int:
         wanted = [c.strip() for c in args.cases.split(",") if c.strip()]
         unknown = [c for c in wanted if c not in all_ids]
         if unknown:
-            print(f"[full] ERROR: unknown case ids in --cases: {unknown} (valid: {all_ids})")
+            print(f"[full] ERROR: unknown case ids in --cases: "
+                  f"{unknown} (valid: {all_ids})")
             return GATE_ERROR
         case_ids = [c for c in all_ids if c in set(wanted)]
-        print(f"[full] --cases filter active: running {case_ids}")
+        print(f"[full] --cases filter active: reasoning cases {case_ids}")
     else:
         case_ids = list(all_ids)
     gate_exit = GATE_PASS
@@ -2883,15 +2953,60 @@ def full_sequential(args) -> int:
             harness_error = True
             break
 
+    shared_extraction: dict = {}
+    if not harness_error:
+        # --- ONE run-level EXTRACTION phase (shared prompt + restart) ---
+        print("\n[full] === SHARED EXTRACTION (run-level, once per run) ===")
+        args.case = EXTRACT_PSEUDO_CASE
+        rc = setup_extraction_phase(args)
+        if rc != 0:
+            harness_error = True
+        else:
+            # --- phase boundary: manifest poll (bounded by phase timeout) ---
+            setup_json = (_load_json(
+                RESULTS_DIR / args.run_id
+                / f"setup-extraction-case-{EXTRACT_PSEUDO_CASE}.json") or {})
+            since_iso = setup_json.get("restarted_at") or _now_iso()
+            phase_timeout_s = float(
+                getattr(args, "phase_timeout_minutes", 0) or 0) * 60 or None
+            poll = _poll_checkpoint_manifest(
+                args, since_iso, timeout_s=phase_timeout_s,
+                stall_minutes=float(getattr(args, "stall_minutes", 0) or 0))
+            _write_json(RESULTS_DIR / args.run_id
+                        / f"wait-manifest-{EXTRACT_PSEUDO_CASE}.json", poll)
+
+            # --- CRITICAL: snapshot the extraction container logs BEFORE
+            # the FIRST reasoning restart (the container is rm'd at the
+            # restart; its logs die with it) ---
+            snap = _snapshot_phase1_logs(args, since_iso)
+            _write_json(RESULTS_DIR / args.run_id
+                        / f"snapshot-phase1-{EXTRACT_PSEUDO_CASE}.json", snap)
+            # preserve the extraction phase's volume snapshots (window
+            # evidence) into results/ — teardown removes the volume copies
+            _copy_window_artifacts(args, EXTRACT_PSEUDO_CASE)
+
+            shared_extraction = {
+                "manifest_found": poll["found"],
+                "manifests": poll.get("manifests", []),
+                "manifest_poll_elapsed_s": poll.get("elapsed_s"),
+                "phase1_snapshot": snap.get("path"),
+                "extraction_restarted_at": since_iso,
+            }
+            if not poll["found"]:
+                print("[full] no checkpoint manifest from the shared "
+                      "extraction — proceeding to per-case reasoning "
+                      "(each case graded truthfully on the current state)")
+
     per_case = {}
     if not harness_error:
         for case_id in case_ids:
-            print(f"\n[full] === CASE {case_id} ===")
+            print(f"\n[full] === CASE {case_id} (REASONING) ===")
             args.case = case_id  # per-case phases read args.case
-            rc = setup_case(args)
+            rc = setup_reasoning_phase(args)
             if rc != 0:
                 harness_error = True
-                per_case[case_id] = {"verdict": "ERROR", "phase": "setup"}
+                per_case[case_id] = {"verdict": "ERROR",
+                                     "phase": "setup-reasoning"}
                 continue
             rc = agent_case(args)
             if rc != 0:
@@ -2899,16 +3014,13 @@ def full_sequential(args) -> int:
                 print(f"[full] case {case_id}: agent timeout — grading anyway")
             rc = grade_case(args)
             _copy_window_artifacts(args, case_id)
-            g = _load_json(RESULTS_DIR / args.run_id / f"grade-case-{case_id}.json") or {}
+            g = _load_json(RESULTS_DIR / args.run_id
+                           / f"grade-case-{case_id}.json") or {}
             per_case[case_id] = {
                 "verdict": g.get("verdict", "FAIL"),
                 "conditions": g.get("conditions", []),
-                # L1 delta 2: layer-split per case — mechanism verdict is
-                # the unchanged A/Q/E/R/P verdict; adherence conditions
-                # ride as their own layer (never flip the mechanism
-                # verdict).
                 "mechanism_verdict": g.get("mechanism_verdict",
-                                           g.get("verdict", "FAIL")),
+                                            g.get("verdict", "FAIL")),
                 "adherence_conditions": g.get("adherence_conditions", []),
                 "adherence_evidence": g.get("adherence_evidence", {}),
             }
@@ -2919,17 +3031,16 @@ def full_sequential(args) -> int:
             # every case graded independently; continue to the next regardless
 
     cases_passed = sum(1 for v in per_case.values() if v.get("verdict") == "PASS")
-    # L1 delta 2: layer-split summary — mechanism pass count is unchanged;
-    # adherence-clean count is reported as its own layer.
     adherence_clean = sum(1 for v in per_case.values()
                           if not v.get("adherence_conditions"))
     summary = {
         "run_id": args.run_id,
-        "mode": "sequential",
+        "mode": "shared-kb",
         "gate_verdict": "PASS" if (cases_passed == len(case_ids) and not harness_error) else "FAIL",
         "cases_passed": cases_passed,
         "cases_total": len(case_ids),
         "adherence_clean_cases": adherence_clean,
+        "shared_extraction": shared_extraction,
         "per_case": per_case,
         "timestamp": _now_iso(),
     }
@@ -2947,165 +3058,7 @@ def full_sequential(args) -> int:
     if harness_error:
         print("\n[full] HARNESS ERROR — see logs above")
         return GATE_ERROR
-    print(f"\n[full] GATE SIGNAL: {'PASS (0)' if gate_exit == GATE_PASS else 'FAIL (2)'}")
-    return gate_exit
-
-
-def full_two_phase(args) -> int:
-    """v2 (skill-split two-phase, directive 2026-11-02 08:25 UTC):
-    preflight -> cleanup-das -> per case (EXTRACTION phase: prompt +
-    restart + checkpoint-manifest poll -> phase-1 docker-log SNAPSHOT ->
-    REASONING phase: prompt + fresh restart -> answer -> grade,
-    independent) -> report -> teardown (always).
-
-    Per case this drives TWO separate agent requests: the phase-1
-    boundary is the checkpoint manifest appearing in the memory volume
-    knowledge-checkpoints/ dir (poll ~30s, bounded by --phase-timeout
-    minutes, default the case window). The phase-1 container logs are
-    snapshotted into results/<run-id>/windows/<case>/phase1-docker.log
-    BEFORE the phase-2 restart (the systemd unit rm -f's the container
-    on restart — the logs die with it). On manifest-poll timeout WITHOUT
-    a manifest the case is graded as-is (phase 2 is skipped — the
-    boundary was never reached and is never invented).
-
-    --cases limits the sequence to a subset (iteration mode).
-    """
-    facts_mod = _facts_mod()
-    all_ids = [c["id"] for c in facts_mod.TEST_CASES]
-    if getattr(args, "cases", ""):
-        wanted = [c.strip() for c in args.cases.split(",") if c.strip()]
-        unknown = [c for c in wanted if c not in all_ids]
-        if unknown:
-            print(f"[full-two-phase] ERROR: unknown case ids in --cases: "
-                  f"{unknown} (valid: {all_ids})")
-            return GATE_ERROR
-        case_ids = [c for c in all_ids if c in set(wanted)]
-        print(f"[full-two-phase] --cases filter active: running {case_ids}")
-    else:
-        case_ids = list(all_ids)
-    gate_exit = GATE_PASS
-    harness_error = False
-
-    phases = [("preflight", preflight), ("cleanup-das", cleanup_das)]
-    for name, fn in phases:
-        print(f"\n[full-two-phase] === {name} ===")
-        out = RESULTS_DIR / args.run_id / f"{name}.json"
-        if out.exists() and not args.force:
-            print(f"[full-two-phase] {name}.json exists — skipping (--force re-runs)")
-            continue
-        rc = fn(args)
-        if rc != 0:
-            print(f"[full-two-phase] {name} FAILED (exit {rc})")
-            harness_error = True
-            break
-
-    per_case = {}
-    if not harness_error:
-        for case_id in case_ids:
-            print(f"\n[full-two-phase] === CASE {case_id} ===")
-            args.case = case_id  # per-case phases read args.case
-
-            # --- phase 1: EXTRACTION (prompt + restart #1) ---
-            rc = setup_extraction_phase(args)
-            if rc != 0:
-                harness_error = True
-                per_case[case_id] = {"verdict": "ERROR", "phase": "setup-extraction"}
-                continue
-
-            # --- phase boundary: manifest poll (bounded by phase timeout) ---
-            setup_json = (_load_json(
-                RESULTS_DIR / args.run_id
-                / f"setup-extraction-case-{case_id}.json") or {})
-            since_iso = setup_json.get("restarted_at") or _now_iso()
-            phase_timeout_s = float(
-                getattr(args, "phase_timeout_minutes", 0) or 0) * 60 or None
-            poll = _poll_checkpoint_manifest(
-                args, since_iso, timeout_s=phase_timeout_s,
-                stall_minutes=float(getattr(args, "stall_minutes", 0) or 0))
-            _write_json(RESULTS_DIR / args.run_id
-                        / f"wait-manifest-{case_id}.json", poll)
-
-            # --- CRITICAL: snapshot phase-1 docker logs BEFORE the
-            # phase-2 restart (the container is rm'd at the restart;
-            # its logs die with it) ---
-            snap = _snapshot_phase1_logs(args, since_iso)
-            _write_json(RESULTS_DIR / args.run_id
-                        / f"snapshot-phase1-{case_id}.json", snap)
-
-            if not poll["found"]:
-                # timeout WITHOUT a manifest: grade the case AS-IS —
-                # phase 2 is skipped (the boundary was never reached;
-                # the harness never invents one). The case fails
-                # truthfully on the current state.
-                print(f"[full-two-phase] case {case_id}: no checkpoint "
-                      "manifest — grading as-is (phase 2 skipped)")
-            else:
-                # --- phase 2: REASONING (prompt + restart #2, fresh
-                # trimmed history — no inherited phase-1 context) ---
-                rc = setup_reasoning_phase(args)
-                if rc != 0:
-                    harness_error = True
-                    per_case[case_id] = {"verdict": "ERROR",
-                                         "phase": "setup-reasoning"}
-                    continue
-                rc = agent_case(args)
-                if rc != 0:
-                    # timeout is a case failure, not a harness error
-                    print(f"[full-two-phase] case {case_id}: agent timeout "
-                          "— grading anyway")
-
-            rc = grade_case(args)
-            _copy_window_artifacts(args, case_id)
-            g = _load_json(RESULTS_DIR / args.run_id
-                           / f"grade-case-{case_id}.json") or {}
-            per_case[case_id] = {
-                "verdict": g.get("verdict", "FAIL"),
-                "conditions": g.get("conditions", []),
-                "mechanism_verdict": g.get("mechanism_verdict",
-                                            g.get("verdict", "FAIL")),
-                "adherence_conditions": g.get("adherence_conditions", []),
-                "adherence_evidence": g.get("adherence_evidence", {}),
-                "two_phase": {
-                    "manifest_found": poll["found"],
-                    "manifests": poll.get("manifests", []),
-                    "manifest_poll_elapsed_s": poll.get("elapsed_s"),
-                    "phase1_snapshot": snap.get("path"),
-                },
-            }
-            if rc == GATE_ERROR:
-                harness_error = True
-            elif rc == GATE_FAIL:
-                gate_exit = GATE_FAIL
-            # every case graded independently; continue to the next regardless
-
-    cases_passed = sum(1 for v in per_case.values() if v.get("verdict") == "PASS")
-    adherence_clean = sum(1 for v in per_case.values()
-                          if not v.get("adherence_conditions"))
-    summary = {
-        "run_id": args.run_id,
-        "mode": "sequential-two-phase",
-        "gate_verdict": "PASS" if (cases_passed == len(case_ids) and not harness_error) else "FAIL",
-        "cases_passed": cases_passed,
-        "cases_total": len(case_ids),
-        "adherence_clean_cases": adherence_clean,
-        "per_case": per_case,
-        "timestamp": _now_iso(),
-    }
-    _write_json(RESULTS_DIR / args.run_id / "grade.json", summary)
-
-    if not args.skip_report:
-        print("\n[full-two-phase] === report ===")
-        report(args)
-
-    print("\n[full-two-phase] === teardown ===")
-    td_rc = teardown(args)
-    if td_rc != 0:
-        harness_error = True
-
-    if harness_error:
-        print("\n[full-two-phase] HARNESS ERROR — see logs above")
-        return GATE_ERROR
-    print(f"\n[full-two-phase] GATE SIGNAL: "
+    print(f"\n[full] GATE SIGNAL: "
           f"{'PASS (0)' if gate_exit == GATE_PASS else 'FAIL (2)'}")
     return gate_exit
 
@@ -3297,6 +3250,16 @@ def report(args) -> int:
     if cleanup:
         lines.append(f"DAS cleanup before run: {cleanup.get('discovered_count', '?')} expressions removed, "
                      f"canaries intact: {cleanup.get('canaries_intact', '?')}")
+
+    # oc2 C3: the shared-extraction section (manifest, receipts, elapsed)
+    shared = grade.get("shared_extraction") or {}
+    if shared:
+        lines.append("")
+        lines.append(f"Shared extraction (run-level, once): manifest "
+                     f"{'found' if shared.get('manifest_found') else 'NOT found'}"
+                     + (f" ({', '.join(shared.get('manifests', []))})"
+                        if shared.get("manifests") else "")
+                     + f", poll elapsed {shared.get('manifest_poll_elapsed_s', '?')}s")
 
     lines.append("")
     lines.append("Condition codes: A_* answer, Q_* query-first (Q_ATTESTED_VIA_ACCESS_LOG "
@@ -3552,19 +3515,20 @@ def build_parser() -> argparse.ArgumentParser:
     fp.add_argument("--batch", action="store_true",
                     help="v2 all-at-once flow (single prompt with all 7 questions)")
     fp.add_argument("--two-phase", action="store_true",
-                    help="skill-split v2 flow: per case, an EXTRACTION agent "
-                         "request followed by a REASONING agent request "
-                         "(checkpoint-manifest poll boundary, phase-1 "
-                         "docker-log snapshot before the phase-2 restart)")
+                    help="DEPRECATED no-op alias (oc2): the default full path "
+                         "is already the shared-KB two-phase flow (ONE "
+                         "run-level EXTRACTION phase covering all cases, then "
+                         "per-case REASONING phases)")
     fp.add_argument("--cases", default="",
                     help="comma-separated subset of case ids to run (iteration mode; "
-                         "default: all cases sequentially)")
+                         "limits the REASONING cases — the shared extraction "
+                         "always covers all cases)")
     fp.add_argument("--cleanup-first", action="store_true", default=True,
                     help="run cleanup-das before the sequential run (default)")
     fp.add_argument("--no-cleanup", dest="cleanup_first", action="store_false")
     fp.add_argument("--timeout-minutes", type=int, default=75)
     fp.add_argument("--phase-timeout-minutes", type=int, default=0,
-                    help="two-phase manifest-poll timeout in minutes "
+                    help="extraction manifest-poll timeout in minutes "
                          "(default 0 = the case window, --timeout-minutes)")
     # L1 delta 3 (Balázs directive 22:54 UTC): stall watchdog — abort
     # a case early when no forward signal (answers.md/facts-index.md
@@ -3625,8 +3589,12 @@ def main() -> int:
             (RESULTS_DIR / args.run_id / "cleanup-das.json").write_text(
                 json.dumps({"skipped": True}))
         if getattr(args, "two_phase", False):
-            return full_two_phase(args)
-        return full_sequential(args)
+            # oc2: --two-phase is a deprecated no-op alias — the
+            # shared-KB flow IS two-phase (extraction + reasoning) and
+            # is the default full path
+            print("[full] --two-phase is a deprecated alias (no-op): the "
+                  "shared-KB extraction flow is the default full path")
+        return full_shared_kb(args)
 
     fn = dispatch[args.phase]
     return fn(args)
