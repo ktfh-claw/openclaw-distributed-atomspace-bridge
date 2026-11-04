@@ -472,6 +472,80 @@ def test_census_persist_receipts_sidecar_unreadable_is_docker_only():
     assert out["sidecar"]["union_count"] == 2
 
 
+# ---------------------------------------------------------------------------
+# oc2 C5: stall-watchdog forward signal reads the receipts sidecar lane
+# ---------------------------------------------------------------------------
+
+def test_recent_persist_signal_sidecar_lane_fixture_receipt():
+    """oc2 C5 (oc1e RCA): the watchdog's fresh-receipt forward signal
+    reads the receipts SIDECAR lane IN ADDITION to the agent-container
+    docker-log grep — under OpenClaw the receipts durably land in
+    <memory-volume>/benchmark/persist-receipts.log while the docker-log
+    lane can stay silent (the oc1 stall false-abort class)."""
+    fresh = rb._now_iso_minus_seconds(30)
+    fixture = f"{fresh} BRIDGE-PERSIST-OK: verified=1 top={H2}\n"
+    reads = []
+
+    def fake_sudo_read(path, timeout=60.0):
+        reads.append(str(path))
+        if str(path).endswith("benchmark/persist-receipts.log"):
+            return fixture
+        return None
+
+    with _Patch(_docker_logs_since=lambda c, s, u: "",
+                _sudo_read=fake_sudo_read):
+        assert rb._recent_persist_signal(
+            rb.OPENCLAW_PROFILE, 120, "/fake/vol") is True
+    assert any(p.endswith("benchmark/persist-receipts.log") for p in reads)
+
+
+def test_recent_persist_signal_stale_sidecar_only_is_false():
+    """Sidecar receipts OLDER than the window do not refresh the stall
+    clock (window semantics identical to the census union)."""
+    stale = rb._now_iso_minus_seconds(600)
+    fixture = f"{stale} BRIDGE-PERSIST-OK: verified=1 top={H2}\n"
+
+    with _Patch(_docker_logs_since=lambda c, s, u: "",
+                _sudo_read=lambda path, timeout=60.0:
+                fixture if str(path).endswith(
+                    "benchmark/persist-receipts.log") else None):
+        assert rb._recent_persist_signal(
+            rb.OPENCLAW_PROFILE, 120, "/fake/vol") is False
+
+
+def test_recent_persist_signal_docker_lane_still_read_first():
+    """Additive, not a replacement: a fresh receipt in the agent
+    container's docker logs still refreshes the clock even when the
+    sidecar is unreadable."""
+    with _Patch(_docker_logs_since=lambda c, s, u: DOCKER_WINDOW_LOGS,
+                _sudo_read=lambda path, timeout=60.0: None):
+        assert rb._recent_persist_signal(
+            rb.OPENCLAW_PROFILE, 120, "/fake/vol") is True
+
+
+def test_recent_persist_signal_both_lanes_silent_is_false():
+    with _Patch(_docker_logs_since=lambda c, s, u: "",
+                _sudo_read=lambda path, timeout=60.0: ""):
+        assert rb._recent_persist_signal(
+            rb.OPENCLAW_PROFILE, 120, "/fake/vol") is False
+
+
+def test_recent_persist_signal_omega_never_reads_sidecar():
+    """omega keeps the exact historical docker-only signal — the sidecar
+    is never opened (the profile does not use the receipts sidecar)."""
+    reads = []
+
+    def fake_sudo_read(path, timeout=60.0):
+        reads.append(str(path))
+        return None
+
+    with _Patch(_docker_logs_since=lambda c, s, u: "",
+                _sudo_read=fake_sudo_read):
+        assert rb._recent_persist_signal(
+            rb.OMEGA_PROFILE, 120, "/fake/vol") is False
+    assert reads == []
+
+
 def test_docker_log_timestamp_parsing():
     ts = rb._docker_log_timestamp(
         f"2026-11-03T10:00:00.123456789Z BRIDGE-PERSIST-OK: verified=1 top={H1}")
