@@ -183,10 +183,13 @@ class _FakeCompleted:
 
 
 def test_sweep_stale_manifests_archives_into_run_archive():
-    """Stale manifests (previous/aborted runs) are mv'd into the run's
-    in-volume archive dir and the boundary namespace is verified empty
-    afterwards (a leftover would satisfy the extraction STOP rule on
-    the first wake cycle and deadlock the manifest poll)."""
+    """oc2 C4: stale manifests (previous/aborted runs) are copied to the
+    HARNESS-SIDE archive (results/<run-id>/archive-manifests/ — OUTSIDE
+    the agent-readable knowledge-checkpoints/ dir; the oc1a idle-trap
+    lesson: an in-volume archive let the agent find the archived
+    manifest and follow the STOP rule) and the originals are rm'd from
+    the checkpoint dir, verified empty afterwards."""
+    import tempfile as _tf
     calls = []
     state = {"census": 0}
 
@@ -201,21 +204,28 @@ def test_sweep_stale_manifests_archives_into_run_archive():
         calls.append(cmd)
         return _FakeCompleted()
 
-    saved = (rb._manifest_census, rb._sudo_run)
+    saved = (rb._manifest_census, rb._sudo_run, rb._sudo_read, rb.RESULTS_DIR)
     rb._manifest_census = fake_census
     rb._sudo_run = fake_sudo
+    rb._sudo_read = lambda p: f"content of {p.name}"
     try:
-        out = rb._sweep_stale_manifests(_args())
-        assert out == ["corpus.md", "windowless-room-original.md"]
-        mkdirs = [c for c in calls if c[0] == "mkdir"]
-        mvs = [c for c in calls if c[0] == "mv"]
-        assert len(mkdirs) == 1 and ".archive-pre-t-run" in mkdirs[0][-1]
-        assert len(mvs) == 2
-        assert all(".archive-pre-t-run" in c[-1] for c in mvs)
-        # post-mv verification census ran (namespace confirmed empty)
-        assert state["census"] == 2
+        with _tf.TemporaryDirectory() as td:
+            rb.RESULTS_DIR = Path(td)
+            out = rb._sweep_stale_manifests(_args())
+            assert out == ["corpus.md", "windowless-room-original.md"]
+            # harness-side archive (OUTSIDE the agent workspace)
+            archive = Path(td) / "t-run" / "archive-manifests"
+            assert (archive / "corpus.md").read_text() == \
+                "content of corpus.md"
+            assert (archive / "windowless-room-original.md").read_text() == \
+                "content of windowless-room-original.md"
+            # originals rm'd from the checkpoint dir (in-volume)
+            rms = [c for c in calls if c[0] == "rm"]
+            assert len(rms) == 2
+            # post-sweep verification census ran (namespace confirmed empty)
+            assert state["census"] == 2
     finally:
-        rb._manifest_census, rb._sudo_run = saved
+        rb._manifest_census, rb._sudo_run, rb._sudo_read, rb.RESULTS_DIR = saved
 
 
 def test_sweep_clean_namespace_is_noop():
@@ -234,17 +244,21 @@ def test_sweep_clean_namespace_is_noop():
 def test_sweep_failure_raises_runtime_error():
     """Any archive failure must raise (setup fails loudly), never
     degrade silently into a contaminated boundary namespace."""
-    saved = (rb._manifest_census, rb._sudo_run)
+    import tempfile as _tf
+    saved = (rb._manifest_census, rb._sudo_run, rb._sudo_read, rb.RESULTS_DIR)
     rb._manifest_census = lambda args: [{"name": "stale.md", "mtime": 1.0}]
     rb._sudo_run = lambda cmd, timeout=None, **kw: _FakeCompleted(rc=1)
+    rb._sudo_read = lambda p: "stale manifest content"
     try:
-        try:
-            rb._sweep_stale_manifests(_args())
-            raise AssertionError("expected RuntimeError")
-        except RuntimeError:
-            pass
+        with _tf.TemporaryDirectory() as td:
+            rb.RESULTS_DIR = Path(td)
+            try:
+                rb._sweep_stale_manifests(_args())
+                raise AssertionError("expected RuntimeError")
+            except RuntimeError:
+                pass
     finally:
-        rb._manifest_census, rb._sudo_run = saved
+        rb._manifest_census, rb._sudo_run, rb._sudo_read, rb.RESULTS_DIR = saved
 
 
 def test_setup_case_extraction_sweeps_and_records():
@@ -467,13 +481,14 @@ def test_phase_templates_carry_source_url_wiring():
 
 
 # ---------------------------------------------------------------------------
-# full_two_phase orchestration: two prompts, two restarts, snapshot
-# before restart #2, grade-as-is on manifest timeout
+# full_shared_kb orchestration (oc2 C3): ONE shared extraction prompt +
+# restart, snapshot before the first reasoning restart, per-case
+# reasoning, grade-each-case even on manifest timeout
 # ---------------------------------------------------------------------------
 
-def _run_full_two_phase(root, poll_found, manifest_names=("corpus.md",),
-                        overrides=None):
-    """Drive full_two_phase with all IO mocked; returns (grade.json,
+def _run_full_shared_kb(root, poll_found, manifest_names=("corpus.md",),
+                        overrides=None, cases="original"):
+    """Drive full_shared_kb with all IO mocked; returns (grade.json,
     call_order). ``overrides`` maps rb attribute -> stub and is applied
     AFTER the defaults (lets a test inject its own snapshot/restart
     spies — the helper's defaults would otherwise clobber them)."""
@@ -506,11 +521,12 @@ def _run_full_two_phase(root, poll_found, manifest_names=("corpus.md",),
             rb.cleanup_das = rec("cleanup-das")
 
             def setup_extraction(args):
-                order.append("setup-extraction(restart#1)")
+                order.append("setup-extraction(shared)")
                 return 0
 
             def setup_reasoning(args):
-                order.append("setup-reasoning(restart#2)")
+                order.append("setup-reasoning(case)")
+
                 return 0
 
             rb.setup_extraction_phase = setup_extraction
@@ -524,7 +540,7 @@ def _run_full_two_phase(root, poll_found, manifest_names=("corpus.md",),
                  "stall_aborted": False})
             rb._snapshot_phase1_logs = (
                 lambda args, since:
-                {"path": str(Path(td) / "t-run/windows/original/"
+                {"path": str(Path(td) / "t-run/windows/extract/"
                               "phase1-docker.log"), "bytes": 123})
             for attr, stub in (overrides or {}).items():
                 setattr(rb, attr, stub)
@@ -543,7 +559,7 @@ def _run_full_two_phase(root, poll_found, manifest_names=("corpus.md",),
                 path.write_text(json.dumps(data), encoding="utf-8")
 
             rb._write_json = write_json
-            rc = rb.full_two_phase(_args(cases="original", skip_report=False,
+            rc = rb.full_shared_kb(_args(cases=cases, skip_report=False,
                                          force=False, cleanup_first=False,
                                          stall_minutes=15, trim_history=True,
                                          phase_timeout_minutes=0))
@@ -556,37 +572,40 @@ def _run_full_two_phase(root, poll_found, manifest_names=("corpus.md",),
             setattr(rb, name, value)
 
 
-def test_full_two_phase_happy_path_ordering():
-    """Per case: extraction restart #1 -> manifest poll -> SNAPSHOT ->
-    reasoning restart #2 -> answer wait -> grade (the addendum's
-    per-case demonstration)."""
-    rc, grade, order = _run_full_two_phase(None, poll_found=True)
-    expected = ["preflight", "cleanup-das",
-                "setup-extraction(restart#1)",
-                "setup-reasoning(restart#2)",  # snapshot first (below)
-                "agent-case", "grade-case", "copy-windows",
-                "report", "teardown"]
-    # exact per-case ordering: poll -> snapshot -> restart #2
-    i_setup1 = order.index("setup-extraction(restart#1)")
-    # the poll and snapshot are recorded via their stubs' side effects:
-    # poll is a lambda (not in order); assert restart #2 comes AFTER the
-    # snapshot call by checking the snapshot stub ran before restart#2 —
-    # the stub records only the path; instead assert the relative order
-    # of the recorded calls
-    assert order[i_setup1 + 1] == "setup-reasoning(restart#2)", order
+def test_full_shared_kb_happy_path_ordering():
+    """oc2 C3: ONE run-level extraction, then per-case reasoning —
+    preflight -> cleanup-das -> setup-extraction(shared, ONCE) ->
+    [poll -> snapshot] -> per case: setup-reasoning -> agent-case ->
+    grade-case -> copy-windows -> report -> teardown."""
+    rc, grade, order = _run_full_shared_kb(None, poll_found=True)
+    assert order.count("setup-extraction(shared)") == 1, \
+        "the extraction must run ONCE per run"
+    assert order.index("setup-extraction(shared)") < \
+        order.index("setup-reasoning(case)"), order
     assert "agent-case" in order
-    assert grade["mode"] == "sequential-two-phase"
+    assert grade["mode"] == "shared-kb"
     assert grade["per_case"]["original"]["verdict"] == "PASS"
-    assert grade["per_case"]["original"]["two_phase"]["manifest_found"] is True
-    assert grade["per_case"]["original"]["two_phase"]["manifests"] == \
-        ["corpus.md"]
-    assert grade["per_case"]["original"]["two_phase"]["manifest_poll_elapsed_s"] == 42
+    shared = grade["shared_extraction"]
+    assert shared["manifest_found"] is True
+    assert shared["manifests"] == ["corpus.md"]
+    assert shared["manifest_poll_elapsed_s"] == 42
     assert rc == rb.GATE_PASS
 
 
-def test_full_two_phase_snapshot_before_reasoning_restart():
-    """CRITICAL: the phase-1 log snapshot runs BEFORE the phase-2
-    restart (the container is rm'd at the restart — logs die with it)."""
+def test_full_shared_kb_extraction_once_three_reasoning_cases():
+    """The extraction runs ONCE even with all three reasoning cases
+    (the oc1 per-case duplication class is eliminated)."""
+    rc, grade, order = _run_full_shared_kb(
+        None, poll_found=True, cases="")  # empty --cases = all cases
+    assert order.count("setup-extraction(shared)") == 1, order
+    assert order.count("setup-reasoning(case)") == 3, order
+    assert order.count("grade-case") == 3, order
+
+
+def test_full_shared_kb_snapshot_before_reasoning_restart():
+    """CRITICAL: the extraction log snapshot runs BEFORE the FIRST
+    per-case reasoning restart (the container is rm'd at the restart —
+    logs die with it)."""
     order_snap = []
 
     def fake_snapshot(args, since):
@@ -594,48 +613,49 @@ def test_full_two_phase_snapshot_before_reasoning_restart():
         return {"path": "x", "bytes": 1}
 
     def fake_setup_reasoning(args):
-        order_snap.append("restart#2")
+        order_snap.append("restart-reasoning")
         return 0
 
-    _rc, _g, _o = _run_full_two_phase(
+    _rc, _g, _o = _run_full_shared_kb(
         None, poll_found=True,
         overrides={"_snapshot_phase1_logs": fake_snapshot,
                    "setup_reasoning_phase": fake_setup_reasoning})
-    assert "snapshot" in order_snap and "restart#2" in order_snap
-    assert order_snap.index("snapshot") < order_snap.index("restart#2")
+    assert "snapshot" in order_snap and "restart-reasoning" in order_snap
+    assert order_snap.index("snapshot") < order_snap.index("restart-reasoning")
 
 
-def test_full_two_phase_timeout_grades_as_is_skips_phase2():
-    """On manifest-poll timeout WITHOUT a manifest the case is graded
-    as-is: phase 2 (restart #2 + answer wait) is SKIPPED — the boundary
-    was never reached and is never invented."""
-    rc, grade, order = _run_full_two_phase(None, poll_found=False)
-    assert "setup-reasoning(restart#2)" not in order, \
-        "phase 2 must be skipped on manifest timeout"
-    assert "agent-case" not in order, \
-        "the answer wait belongs to phase 2 — skipped on timeout"
-    assert "grade-case" in order, "the case is graded as-is"
-    per = grade["per_case"]["original"]
-    assert per["two_phase"]["manifest_found"] is False
-    assert per["two_phase"]["manifests"] == []
+def test_full_shared_kb_timeout_still_proceeds_to_reasoning():
+    """On extraction manifest-poll timeout WITHOUT a manifest the run
+    STILL proceeds to the per-case reasoning (the harness never
+    invents a boundary — each case is graded truthfully on the current
+    state; the missing manifest is recorded in the shared-extraction
+    section)."""
+    rc, grade, order = _run_full_shared_kb(None, poll_found=False)
+    assert "setup-reasoning(case)" in order, \
+        "per-case reasoning must still run on extraction timeout"
+    assert "agent-case" in order, \
+        "the answer wait belongs to the reasoning phase — still runs"
+    assert "grade-case" in order, "each case is graded as-is"
+    shared = grade["shared_extraction"]
+    assert shared["manifest_found"] is False
+    assert shared["manifests"] == []
     rc  # the grade stub returns PASS but the flow ran; rc recorded
 
 
-def test_full_two_phase_timeout_still_snapshots_phase1_logs():
-    """Even on manifest timeout the phase-1 snapshot happens (before any
-    later restart destroys the container)."""
+def test_full_shared_kb_timeout_still_snapshots_extraction_logs():
+    """Even on manifest timeout the extraction snapshot happens (before
+    any later restart destroys the container)."""
     snapped = []
 
     def fake_snapshot(args, since):
         snapped.append(since)
         return {"path": "x", "bytes": 1}
 
-    _rc, grade, _o = _run_full_two_phase(
+    _rc, grade, _o = _run_full_shared_kb(
         None, poll_found=False,
         overrides={"_snapshot_phase1_logs": fake_snapshot})
-    assert len(snapped) == 1, "phase-1 snapshot must run once"
-    assert grade["per_case"]["original"]["two_phase"]["phase1_snapshot"] \
-        == "x"
+    assert len(snapped) == 1, "extraction snapshot must run once"
+    assert grade["shared_extraction"]["phase1_snapshot"] == "x"
 
 
 def test_poll_stall_aborts_wait_without_forward_signal():
