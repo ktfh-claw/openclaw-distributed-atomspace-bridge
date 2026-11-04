@@ -170,6 +170,7 @@ def test_watchdog_quiet_register_does_not_reset():
 
 
 def test_default_stall_minutes():
-    # Balázs directive 22:54 UTC: ~10-15 min is the healthy case budget;
-    # the watchdog default is the upper bound of that range.
-    assert rb.DEFAULT_STALL_MINUTES == 15
+    # Raised 15 -> 25 (smoke-20261103f false-case RCA, 2026-11-04):
+    # observed extraction paces run 10-20 min without a persist receipt
+    # (manifest-only forward signal); 15 min aborted healthy turns.
+    assert rb.DEFAULT_STALL_MINUTES == 25

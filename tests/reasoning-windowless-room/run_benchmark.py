@@ -548,7 +548,7 @@ def _union_receipt_census(docker_matched: list[str], sidecar_text: str,
 # mechanism verdict.
 # ---------------------------------------------------------------------------
 
-DEFAULT_STALL_MINUTES = 15
+DEFAULT_STALL_MINUTES = 25
 
 # Emission lane only: the agent's pin tool calls appear in docker logs as
 # ``COMMAND_RETURN: ((pin "LEDGER: ...") "SUCCESS, RETURN: PIN-SUCCESS")``.
