@@ -109,3 +109,56 @@ def facts_for_case(case_id: str) -> list[dict]:
                     ids.update(c["required_facts"])
             return [get_fact(fid) for fid in sorted(ids) if get_fact(fid) is not None]
     return []
+
+
+# ---------------------------------------------------------------------------
+# oc3 reasoning battery (specs/oc3-reasoning-battery/spec.md R1): the 5
+# additional "manual reasoning questions". Same dict shape as TEST_CASES
+# entries; runs against the ALREADY-EXTRACTED live KB in DAS (no shared
+# extraction, no cleanup-das — the harness preflight probes the read-
+# proxy for a windowless-room fact and aborts if the KB is absent).
+# Placed strictly AFTER the existing lists (CANONICAL_FACTS / TEST_CASES
+# bodies untouched).
+# ---------------------------------------------------------------------------
+BATTERY_CASES: list[dict] = [
+    {
+        "id": "stars-claim",
+        "prompt_file": "prompts/stars-claim-prompt.md",
+        "question": "A friend claims that in a windowless room with the lights on, looking up you can see the stars at night. Refute or confirm this claim strictly from stored knowledge, showing each retrieval step and which background file each fact came from.",
+        "expected_answer": "Refuted — in a windowless room the ceiling blocks the view of the sky/stars; no natural light enters.",
+        "grading": "CORRECT iff the answer REFUTES the claim — the ceiling blocks the view of the sky/stars in a windowless room (no natural light enters); affirming the claim or answering that the stars are visible is INCORRECT.",
+        "required_facts": ["F04", "F05", "F11", "F12", "F14", "F15", "F18"],
+    },
+    {
+        "id": "floor-lamp",
+        "prompt_file": "prompts/floor-lamp-prompt.md",
+        "question": "You turn on a lamp that is placed on the floor of a windowless room, then look straight up. What is visible above you? Distinguish between the light source below and what is above, and cite the stored facts for each step.",
+        "expected_answer": "The ceiling (the room remains enclosed above the observer; the floor lamp illuminates the room interior/surfaces, and the first opaque surface above is the ceiling).",
+        "grading": "CORRECT iff the answer states the observer sees the ceiling (accept 'ceiling', 'the ceiling', ceiling + lamp/bulb); answering sky/sun/stars as the primary thing seen is INCORRECT.",
+        "required_facts": ["F04", "F12", "F14", "F16", "F17"],
+    },
+    {
+        "id": "burned-bulb",
+        "prompt_file": "prompts/burned-bulb-prompt.md",
+        "question": "An astronaut is sitting in a windowless room with a light bulb mounted on the ceiling. The bulb burns out and goes dark. What can the astronaut see when looking straight up, and why? Reason step by step strictly from the stored knowledge base: formalize each question as a MeTTa query, retrieve from DAS, and quote the receipts. Then state which stored facts led to the answer and which background file each came from.",
+        "expected_answer": "The ceiling (dark — the room is unlit with no active light source, but the ceiling is still the opaque surface above, blocking the sky; nothing above it is visible).",
+        "grading": "CORRECT iff the answer states the astronaut sees the ceiling — the room is unlit with no active light source and the ceiling is still the opaque surface above, blocking the sky; answering that nothing at all is visible (ignoring that the ceiling is still there but dark), or sky/stars, is INCORRECT.",
+        "required_facts": ["F04", "F12", "F14", "F16", "F31"],
+    },
+    {
+        "id": "stv-derivation",
+        "prompt_file": "prompts/stv-derivation-prompt.md",
+        "question": "Derive the answer to the windowless-room look-up question from stored knowledge as a MeTTa derivation: formalize the question as a query clause, retrieve the supporting facts, and produce the grounded conclusion with (stv ...) truth values in the (|~ ...) derivation format, verifying each step against DAS receipts.",
+        "expected_answer": "A grounded (|~ ...) derivation whose conclusion is the ceiling answer with (stv ...) truth values, each premise verified by a DAS retrieve receipt.",
+        "grading": "CORRECT iff the answer carries a grounded MeTTa derivation whose conclusion is the ceiling (the look-up answer) with (stv ...) truth values, each premise verified by a DAS retrieve receipt; a derivation concluding sky/stars or lacking the derivation is INCORRECT.",
+        "required_facts": ["F04", "F11", "F12", "F14"],
+    },
+    {
+        "id": "color-probe",
+        "prompt_file": "prompts/color-probe-prompt.md",
+        "question": "What color is the ceiling in a windowless room? Answer strictly from stored knowledge and prove your answer with retrieve receipts.",
+        "expected_answer": "Reports inability to answer from stored knowledge (no color facts stored) — must not state a color.",
+        "grading": "CORRECT iff the answer reports inability to answer from stored knowledge AND does not state a specific color (e.g. naming a color like 'white' is INCORRECT).",
+        "required_facts": [],
+    },
+]
