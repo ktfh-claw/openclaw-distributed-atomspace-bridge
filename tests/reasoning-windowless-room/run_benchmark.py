@@ -384,6 +384,14 @@ def _case_by_id(case_id: str) -> dict | None:
     for c in _facts_mod().TEST_CASES:
         if c["id"] == case_id:
             return c
+    # oc3: battery case ids resolve through BATTERY_CASES (the battery
+    # reuses the per-case reasoning flow — setup-reasoning-case /
+    # agent-case / grade-case — with case dicts of the same shape as
+    # TEST_CASES entries; standard ids always resolve from TEST_CASES
+    # first, so the 3-case flow is unchanged)
+    for c in _facts_mod().BATTERY_CASES:
+        if c["id"] == case_id:
+            return c
     return None
 
 
@@ -999,6 +1007,32 @@ _OPENCLAW_PREFLIGHT_KEYS = [
 ]
 
 
+# oc3 --battery (spec: specs/oc3-reasoning-battery/spec.md R2): the
+# battery runs against the ALREADY-EXTRACTED live KB in DAS — no shared
+# extraction, no cleanup-das. The preflight must verify the KB is
+# present: probe the read-proxy for at least one windowless-room fact
+# and abort with a clear preflight error if the KB is absent.
+BATTERY_KB_PROBE_QUERY = '(Inheritance (Concept "windowless-room") $X)'
+
+
+def _battery_kb_probe(args) -> str:
+    """oc3: probe the read-proxy for at least one windowless-room fact
+    (the live KB the battery reuses). Returns the preflight check
+    value: 'count=<n>' when the probe resolved (count > 0 = KB
+    present), 'absent' when the KB is not present, 'error: ...' on a
+    probe failure."""
+    try:
+        resp = _http_post(args.read_proxy + "/v1/query", {
+            "metta": BATTERY_KB_PROBE_QUERY, "max_answers": 10,
+        }, timeout=30.0)
+        count = resp.get("count", 0)
+        if count and count > 0:
+            return f"count={count}"
+        return "absent"
+    except Exception as e:
+        return f"error: {e}"
+
+
 def preflight(args) -> int:
     """Preflight phase: verify environment is ready for the benchmark."""
     profile = _profile(args)
@@ -1169,6 +1203,13 @@ def preflight(args) -> int:
         except Exception as e:
             checks["canary_fetch_ai"] = f"error: {e}"
 
+        # oc3 --battery: the live KB must be present — probe the
+        # read-proxy for at least one windowless-room fact (spec R2).
+        # Battery mode only; the standard path (no --battery) is
+        # unchanged.
+        if getattr(args, "battery", ""):
+            checks["battery_kb_present"] = _battery_kb_probe(args)
+
         # v16: the A-gate judge must be resolvable and answering BEFORE the
         # run starts — a dead judge would burn every 75-minute case window
         # on A_JUDGE_UNAVAILABLE.
@@ -1199,6 +1240,10 @@ def preflight(args) -> int:
             for key in _OPENCLAW_PREFLIGHT_KEYS:
                 checks[key] = "dry-run"
         checks["canary_fetch_ai"] = "dry-run"
+        # oc3 --battery: the KB probe is skipped in dry-run (no live
+        # read-proxy call)
+        if getattr(args, "battery", ""):
+            checks["battery_kb_present"] = "dry-run"
         checks["judge_smoke"] = "dry-run"
 
     ok_values = {"ok", "running", "dry-run"}
@@ -3109,6 +3154,119 @@ def full_shared_kb(args) -> int:
     return gate_exit
 
 
+def full_battery(args) -> int:
+    """oc3 --battery mode (spec: specs/oc3-reasoning-battery/spec.md):
+    the 5 additional reasoning cases (the "manual reasoning questions")
+    run against the ALREADY-EXTRACTED live KB in DAS — NO shared
+    extraction and NO cleanup-das (the live KB must be preserved for
+    subsequent battery runs and the oc3 series; the preflight probes
+    the read-proxy for a windowless-room fact and aborts with a clear
+    error if the KB is absent).
+
+    Flow: preflight (standard env checks + the battery live-KB probe)
+    -> PER BATTERY CASE (the 5 BATTERY_CASES): reasoning-phase restart
+    (fresh per-case session, oc2 C6 pattern wr-<run>-case-<case>) ->
+    answer wait (stall watchdog) -> grade -> report -> teardown. The
+    per-case flow is identical to the standard per-case reasoning
+    flow; the battery cases are just different case ids. The on-disk
+    extraction record (facts-index.md) is NOT reset — the battery
+    reuses the live KB's record left by the prior extraction run (the
+    E-gate checks the battery cases' FACTS lines against it); only
+    answers.md starts fresh per battery run."""
+    facts_mod = _facts_mod()
+    battery_ids = [c["id"] for c in facts_mod.BATTERY_CASES]
+    gate_exit = GATE_PASS
+    harness_error = False
+
+    battery_name = getattr(args, "battery", "")
+    if battery_name and battery_name != "battery":
+        print(f"[full] ERROR: unknown battery: {battery_name!r} "
+              f"(valid: battery)")
+        return GATE_ERROR
+
+    print("\n[battery] === preflight (standard env checks + live-KB probe) ===")
+    rc = preflight(args)
+    if rc != 0:
+        print("[battery] preflight FAILED — aborting (the battery requires "
+              "the live KB in DAS; run the standard full flow first to "
+              "extract it, or re-extract before a battery run)")
+        return rc
+
+    # fresh answers.md at battery run start (the battery has no
+    # extraction phase; the per-case reasoning phases accumulate into it —
+    # mirrors the standard run-start initialization)
+    paths = _bench_paths(args)
+    if args.dry_run:
+        print("[battery] [dry-run] would init answers.md fresh at battery "
+              "run start")
+    else:
+        _sudo_write(paths["answers"],
+                    f"# Benchmark answers — {args.run_id} (battery)\n")
+
+    per_case = {}
+    for case_id in battery_ids:
+        print(f"\n[battery] === CASE {case_id} (REASONING) ===")
+        args.case = case_id  # per-case phases read args.case
+        rc = setup_reasoning_phase(args)
+        if rc != 0:
+            harness_error = True
+            per_case[case_id] = {"verdict": "ERROR",
+                                 "phase": "setup-reasoning"}
+            continue
+        rc = agent_case(args)
+        if rc != 0:
+            # timeout is a case failure, not a harness error
+            print(f"[battery] case {case_id}: agent timeout — grading anyway")
+        rc = grade_case(args)
+        _copy_window_artifacts(args, case_id)
+        g = _load_json(RESULTS_DIR / args.run_id
+                       / f"grade-case-{case_id}.json") or {}
+        per_case[case_id] = {
+            "verdict": g.get("verdict", "FAIL"),
+            "conditions": g.get("conditions", []),
+            "mechanism_verdict": g.get("mechanism_verdict",
+                                        g.get("verdict", "FAIL")),
+            "adherence_conditions": g.get("adherence_conditions", []),
+            "adherence_evidence": g.get("adherence_evidence", {}),
+        }
+        if rc == GATE_ERROR:
+            harness_error = True
+        elif rc == GATE_FAIL:
+            gate_exit = GATE_FAIL
+        # every case graded independently; continue to the next regardless
+
+    cases_passed = sum(1 for v in per_case.values() if v.get("verdict") == "PASS")
+    adherence_clean = sum(1 for v in per_case.values()
+                          if not v.get("adherence_conditions"))
+    summary = {
+        "run_id": args.run_id,
+        "mode": "battery",
+        "gate_verdict": "PASS" if (cases_passed == len(battery_ids) and not harness_error) else "FAIL",
+        "cases_passed": cases_passed,
+        "cases_total": len(battery_ids),
+        "adherence_clean_cases": adherence_clean,
+        "per_case": per_case,
+        "timestamp": _now_iso(),
+    }
+    _write_json(RESULTS_DIR / args.run_id / "grade.json", summary)
+
+    if not args.skip_report:
+        print("\n[battery] === report ===")
+        report(args)
+
+    print("\n[battery] === teardown ===")
+    td_rc = teardown(args)
+    if td_rc != 0:
+        harness_error = True
+
+    if harness_error:
+        print("\n[battery] HARNESS ERROR — see logs above")
+        return GATE_ERROR
+    print(f"\n[battery] GATE SIGNAL: "
+          f"{'PASS (0)' if gate_exit == GATE_PASS else 'FAIL (2)'}")
+    return gate_exit
+
+
 # ---------------------------------------------------------------------------
 # batch grade (offline re-grade of a whole answers.md; v2 semantics + E/P)
 # ---------------------------------------------------------------------------
@@ -3561,6 +3719,17 @@ def build_parser() -> argparse.ArgumentParser:
     fp = add_common(subparsers.add_parser("full"))
     fp.add_argument("--batch", action="store_true",
                     help="v2 all-at-once flow (single prompt with all 7 questions)")
+    # oc3: the on-demand reasoning-battery mode (spec
+    # specs/oc3-reasoning-battery/spec.md) — 5 additional reasoning
+    # cases against the ALREADY-EXTRACTED live KB in DAS (no shared
+    # extraction, no cleanup-das; preflight probes the read-proxy for
+    # the KB and aborts if absent)
+    fp.add_argument("--battery", default="", metavar="BATTERY",
+                    help="oc3: run the reasoning battery (the 5 manual "
+                         "reasoning questions) against the ALREADY-"
+                         "EXTRACTED live KB in DAS — no shared "
+                         "extraction, no cleanup-das (the live KB is "
+                         "reused and preserved)")
     fp.add_argument("--two-phase", action="store_true",
                     help="DEPRECATED no-op alias (oc2): the default full path "
                          "is already the shared-KB two-phase flow (ONE "
@@ -3629,6 +3798,10 @@ def main() -> int:
     if args.phase == "full":
         if getattr(args, "batch", False):
             return full_batch(args)
+        if getattr(args, "battery", ""):
+            # oc3: the reasoning-battery mode — no shared extraction, no
+            # cleanup-das (the live KB is reused and preserved)
+            return full_battery(args)
         if not args.cleanup_first:
             # skip cleanup-das by pre-creating its result marker
             (RESULTS_DIR / args.run_id / "cleanup-das.json").parent.mkdir(
