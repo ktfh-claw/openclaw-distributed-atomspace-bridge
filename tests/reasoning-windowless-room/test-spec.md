@@ -41,6 +41,10 @@ Sequential-mode properties:
 
 Single prompt with all 7 questions (`prompts.txt`, rendered per-case sections); phases: preflight → setup (harness archives the 5 sources via POST /v1/archive) → agent (poll for all 7 answers, default timeout 60 m) → grade (all cases against one benchmark window) → report → teardown.
 
+### `--battery` mode (oc3)
+
+`full --battery battery` runs the 5 additional reasoning cases (the "manual reasoning questions", defined in `facts.BATTERY_CASES` — `stars-claim`, `floor-lamp`, `burned-bulb`, `stv-derivation`, `color-probe`) against the **ALREADY-EXTRACTED live KB in DAS** — no shared extraction and no cleanup-das (the live KB is reused and preserved for subsequent battery runs and the oc3 series). The preflight probes the read-proxy for a windowless-room fact and aborts the run with a clear error when the KB is absent. Per-case flow identical to the standard per-case reasoning flow (setup-reasoning-case → answer wait with stall watchdog → grade-case, per-case session ids `wr-<run>-case-<case>`); fresh `answers.md` per battery run, `facts-index.md` carries over (the live KB's record). `gate_verdict` PASS iff all 5 battery cases PASS. What the cases probe: long-chain refutation (`stars-claim`), light-source-position invariance (`floor-lamp`), state-change reasoning (`burned-bulb`), stv derivation compliance (`stv-derivation`), and a provenance-abuse negative probe (`color-probe` — no color facts stored, a refusal is the correct answer; `required_facts = []`).
+
 ## Test Structure — Phases
 
 Orchestrated by `run_benchmark.py` (phases independently runnable over SSH):
