@@ -94,7 +94,11 @@ docker network connect --alias atomdb-broker \
 2. Write clients join the broker **directly** (`known_peer` = broker DNS
    name). A mis-routed `atomdb` command **crashes the query engine**
    (uncaught `std::runtime_error`, upstream defect — see
-   `docs/contributions/issue-1-qe-crash.md`).
+   `issue-1-qe-crash.md` in the canonical contributions ladder of
+   [low-cost-omega-setup](https://github.com/ktfh-claw/low-cost-omega-setup/tree/main/docs/contributions/das-issue-proposals)).
+   Note: the atomdb-broker also leaks ~26 threads + a pooled port per
+   delivered `<atomdb>` command (upstream defect, draft `issue-6` there) —
+   expect periodic broker restarts under sustained write traffic.
 3. The callback-peer rewrite host for `atomdb` commands is the broker DNS
    name (services announce unroutable `0.0.0.0:<port>` callback peers).
 4. The broker must resolve as `atomdb-broker` on the client network

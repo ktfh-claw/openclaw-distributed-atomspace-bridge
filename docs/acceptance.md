@@ -72,7 +72,9 @@ Unit suite on the pinned upstream client (`e12573cc`): **123 passed**
 - Handles are deterministic (pinned-client hashing): client-computed ==
   server-stored, live-verified.
 - Known upstream defects worked around at the bridge (all live-verified;
-  drafts in `docs/contributions/`): QE crash on mis-routed `atomdb`
+  drafts in the canonical contributions ladder of
+  [`low-cost-omega-setup`](https://github.com/ktfh-claw/low-cost-omega-setup/tree/main/docs/contributions)):
+  QE crash on mis-routed `atomdb`
   commands (invariant 2); python-client parameter typo; nested handle
   vector mis-decode; `abort()` list-vs-dict.
 

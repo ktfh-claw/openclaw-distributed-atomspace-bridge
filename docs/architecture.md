@@ -42,7 +42,7 @@ das-retrieve skill → (plugin-mounted das_skills v2 adapter) → read-proxy →
 
 - **Working shape:** MeTTa-mode patterns `{"metta": "(Inheritance (Concept \"x402\") $X)", "max_answers": 10}` (mandatory `$variable`; ground patterns never complete on the pinned engine); `{"query": ...}` lenient alias; structural `LINK_TEMPLATE` tokens still accepted. The v1 adapter's gates (exact-key request schema forbidding metta mode; response schema rejecting the proxy's `mode` key) made the read path unreachable end-to-end — root-caused + fixed 2026-10-20 iteration 29, live-verified.
 - **Config-only binding:** the `das-read` plugin (mounted `:ro`) rebinds the `das-retrieve` clause to the mounted v2 module — same remove-then-add single-definition invariant as `das-write`. The `src/das_skills.py` `:ro` file overlay in `start.sh` is a redundant fallback with identical bytes.
-- **Workaround applied at config level:** the stock python client sends a typo'd parameter (`user_metta_as_query_tokens`) — the bridge's client wrapper sends the correct spelling until the upstream fix lands (see [contributions](contributions/README.md) #2).
+- **Workaround applied at config level:** the stock python client sends a typo'd parameter (`user_metta_as_query_tokens`) — the bridge's client wrapper sends the correct spelling until the upstream fix lands (see contributions ladder #2 in [`low-cost-omega-setup`](https://github.com/ktfh-claw/low-cost-omega-setup/tree/main/docs/contributions)).
 
 ### Agent-image provenance (truth note, 2026-10-20)
 
@@ -84,7 +84,7 @@ This replaces the retired `campaign_import.py` operator lane for bulk loads; pro
 ## 5. Deployment invariants (live-discovered — violating any of these breaks the lane)
 
 1. **Broker binds `0.0.0.0`** (not a hostname) in multi-network docker deployments.
-2. **Clients join the broker directly** (peer-id = broker DNS name). Never route `atomdb` commands via the query-engine — an unregistered-command crash takes the QE container down (upstream defect #1 in [contributions](contributions/README.md)).
+2. **Clients join the broker directly** (peer-id = broker DNS name). Never route `atomdb` commands via the query-engine — an unregistered-command crash takes the QE container down (upstream defect #1 in the [`low-cost-omega-setup` contributions ladder](https://github.com/ktfh-claw/low-cost-omega-setup/tree/main/docs/contributions)).
 3. **Client callback-peer rewrite host = broker name** for atomdb commands.
 
 ## 6. Security model

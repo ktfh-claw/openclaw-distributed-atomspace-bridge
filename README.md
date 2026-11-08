@@ -32,7 +32,7 @@ It supersedes the earlier "operator-gated DAS import" design documented here bef
 5. **`&persistent` interception hook** — the agent's existing persistence vocabulary becomes durable, verified DAS writes.
 6. **OpenClaw-SUT deployment + skills** — `deploy/openclaw-sut/` (pinned-image wrapper, compose, systemd unit, config overlay, workspace seed, `deploy.sh`) + `skills-sut/` (the six benchmark skills).
 7. **The windowless-room gating benchmark** — `tests/reasoning-windowless-room/`: the agent-under-test e2e harness with the `--agent-profile` seam (omega = historical control arm, openclaw = current arm).
-8. **Upstream contribution lane** — evidence-backed issue drafts and fork-local PRs for every defect this campaign found in upstream code (see [`docs/contributions/`](docs/contributions/README.md)).
+8. **Upstream contribution lane** — evidence-backed issue drafts and fork-local PRs for every defect this campaign found in upstream code (canonical home: [`low-cost-omega-setup` → `docs/contributions/`](https://github.com/ktfh-claw/low-cost-omega-setup/tree/main/docs/contributions); formerly duplicated in this repo, consolidated there 2026-11-08).
 
 ## Document map
 
@@ -44,7 +44,7 @@ It supersedes the earlier "operator-gated DAS import" design documented here bef
 | [`docs/architecture.md`](docs/architecture.md) | Path B design: components, data flows, interface contracts, topology, security model. |
 | [`docs/campaign-plan.md`](docs/campaign-plan.md) | The overall task: directive, phases, deliverables, acceptance criteria, tracking rules. |
 | [`docs/status.md`](docs/status.md) | Live status: iteration log with evidence links. Updated every cron iteration. |
-| [`docs/contributions/README.md`](docs/contributions/README.md) | Upstream contribution ladder + per-contribution status (issues/PRs on forks). |
+| [`low-cost-omega-setup` → `docs/contributions/`](https://github.com/ktfh-claw/low-cost-omega-setup/tree/main/docs/contributions) | Upstream contribution ladder + per-contribution status (issues/PRs on forks) — canonical home, consolidated 2026-11-08 (previously `docs/contributions/` here). |
 | [`docs/runbook.md](docs/runbook.md) | From-scratch deployment runbook (target: any operator can rebuild the whole lane). |
 | [`historical/`](historical/) | Pre-bridge campaign documents (superseded operator-gated import lane, uplift provenance, experiment reports). |
 
@@ -81,5 +81,5 @@ Full design, contracts, and the three live-discovered deployment invariants: [`d
 - All work stays on the `ktfh-claw` forks and this repo's `main` branch; **nothing upstream without explicit approval**.
 - New code → pushed to the fork repos, with GitHub links recorded in the live Google Doc.
 - Upstream issue/PR content is drafted and, where executable, opened **only in the forked repositories** first.
-- Outdated fork branches are archived/deleted as they become superseded (see [`docs/contributions/README.md`](docs/contributions/README.md)).
+- Outdated fork branches are archived/deleted as they are superseded (see the contributions ladder in [`low-cost-omega-setup`](https://github.com/ktfh-claw/low-cost-omega-setup/tree/main/docs/contributions)).
 - The Google Doc is the main reporting interface; `docs/status.md` mirrors it per iteration.
