@@ -1783,6 +1783,36 @@ def _render_reasoning_prompt(args, case: dict) -> str:
             profile)
 
 
+# oc3 audit R1 (specs/oc3-research-audit-mode/spec.md): the battery
+# reasoning template — the standard reasoning template PLUS the
+# mandatory live-retrieve contract (the agent must perform a LIVE
+# das-retrieve for its QUERY against the read-proxy in the case window
+# BEFORE writing FACTS and quote THAT live receipt; the oc3-battery
+# finding: without it the agent answers from workspace memory with
+# copied receipts and Q_NOT_IN_HISTORY records the memory-answer mode
+# universally). The STANDARD reasoning template stays untouched.
+BATTERY_REASONING_TEMPLATE = "agent_battery_reasoning_prompt_template.md"
+
+
+def _render_battery_reasoning_prompt(args, case: dict) -> str:
+    """Render agent_battery_reasoning_prompt_template.md for ONE battery
+    case (oc3 audit R1). An external pack case's optional ``prompt``
+    (full prompt text override) replaces the question text in the
+    rendered question section; built-in battery cases render their
+    ``question``."""
+    profile = _profile(args)
+    template = (HERE / BATTERY_REASONING_TEMPLATE).read_text(encoding="utf-8")
+    question = case.get("prompt") or case["question"]
+    return _apply_profile_prompt_paths((template
+            .replace("{{RUN_ID}}", args.run_id)
+            .replace("{{CASE_ID}}", case["id"])
+            .replace("{{QUESTION}}", question)
+            .replace("{{URL_LIST_PATH}}", profile.urls_prompt_rel)
+            .replace("{{ANSWERS_PATH}}", profile.answers_prompt_rel)
+            .replace("{{FACTS_INDEX_PATH}}", profile.facts_index_prompt_rel)),
+            profile)
+
+
 def _agent_restart(profile: AgentProfile | None = None) -> bool:
     """Restart the agent under test via its profile's systemd unit (omega:
     ``sudo systemctl restart omega-curiosity.service`` — byte-for-byte
@@ -2126,7 +2156,13 @@ def setup_case(args, phase: str = None) -> int:
     if phase == "extraction":
         rendered = _render_extraction_prompt(args, case)
     elif phase == "reasoning":
-        rendered = _render_reasoning_prompt(args, case)
+        # oc3 audit R1: battery-mode cases render the battery template
+        # (mandatory live-retrieve contract); the standard 3-case flow
+        # keeps the standard reasoning template byte-identically
+        if getattr(args, "battery", ""):
+            rendered = _render_battery_reasoning_prompt(args, case)
+        else:
+            rendered = _render_reasoning_prompt(args, case)
     else:
         rendered = _render_case_prompt(args, case)
     if not _sudo_write(paths["prompt"], rendered):
