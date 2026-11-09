@@ -2732,6 +2732,83 @@ def _get_judge(args):
     return _lazy_judge
 
 
+# oc3 audit R3 (specs/oc3-research-audit-mode/spec.md): expected-answer-
+# optional judging. A case WITHOUT an expected_answer (external research
+# question packs) is judged by the FAITHFULNESS judge — a NEW prompt
+# template (faithfulness_judge.py) asking whether the final answer
+# follows strictly from the facts the agent presented. llm_judge.py and
+# grading.py stay byte-identical: the selection happens HERE, at the
+# judge-wiring seam (grade_case), and the presented evidence (the
+# graded block's FACTS/REASONING lines) is injected into the judge's
+# case dict at the same seam.
+_BUILT_FAITHFULNESS_JUDGE: dict[str, object] = {}
+
+
+def _get_faithfulness_judge(args):
+    """Faithfulness judge callable; None in dry-run. Built lazily on the
+    first expected-answer-less graded case so a missing/unresolvable key
+    surfaces per-case as A_JUDGE_UNAVAILABLE, never as a crash (mirrors
+    _get_judge)."""
+    if getattr(args, "dry_run", False):
+        return None
+
+    def _lazy_faithfulness(case: dict, final_answer: str):
+        if "judge" not in _BUILT_FAITHFULNESS_JUDGE:
+            import llm_judge
+            import faithfulness_judge
+            _BUILT_FAITHFULNESS_JUDGE["judge"] = (
+                faithfulness_judge.make_faithfulness_judge(
+                    base_url=(getattr(args, "judge_base_url", "")
+                              or llm_judge.DEFAULT_BASE_URL),
+                    model=(getattr(args, "judge_model", "")
+                           or llm_judge.DEFAULT_MODEL),
+                    api_key=getattr(args, "judge_api_key", ""),
+                    timeout=(float(getattr(args, "judge_timeout", 0) or 0)
+                             or llm_judge.DEFAULT_TIMEOUT),
+                ))
+        return _BUILT_FAITHFULNESS_JUDGE["judge"](case, final_answer)
+
+    return _lazy_faithfulness
+
+
+def _presented_evidence(block) -> str:
+    """R3: the facts the agent presented — the graded answers block's
+    FACTS and REASONING lines, verbatim (the faithfulness judge's
+    evidence base); '' when the block is missing."""
+    if block is None:
+        return ""
+    parts: list[str] = []
+    if getattr(block, "facts_raw", ""):
+        parts.append(f"FACTS: {block.facts_raw}")
+    if getattr(block, "reasoning_raw", ""):
+        parts.append(f"REASONING: {block.reasoning_raw}")
+    return "\n".join(parts)
+
+
+def _case_judge_fn(args, case: dict, block):
+    """R3 judge-selection seam (the ONLY wiring change on the grade
+    path): a case WITH an expected_answer keeps the existing A-gate
+    judge EXACTLY (same callable _get_judge returns); a case WITHOUT
+    one is judged by the faithfulness judge, with the presented
+    evidence (the block's FACTS/REASONING lines) injected into the
+    judge's case dict here. None in dry-run (grade_answer then emits
+    A_JUDGE_UNAVAILABLE, same as an unconfigured judge)."""
+    if case.get("expected_answer"):
+        return _get_judge(args)
+    import faithfulness_judge
+    faith = _get_faithfulness_judge(args)
+    if faith is None:
+        return None
+    presented = _presented_evidence(block)
+
+    def _faithfulness(case_arg: dict, final_answer: str):
+        enriched = dict(case_arg)
+        enriched[faithfulness_judge.PRESENTED_EVIDENCE_KEY] = presented
+        return faith(enriched, final_answer)
+
+    return _faithfulness
+
+
 def _case_since_iso(rd: Path, case: str) -> str:
     """The census/attestation window start for a case (oc3 fix): the
     run-level extraction restart (setup-case-extract.json, standard
@@ -2880,7 +2957,10 @@ def grade_case(args) -> int:
         attestation=attestation,
         facts_index_raw=facts_index_text,
         presence_fn=reissue,
-        judge_fn=_get_judge(args),
+        # oc3 audit R3: judge selection — expected-answer cases keep the
+        # existing judge; expected-answer-less cases get the
+        # faithfulness judge (llm_judge/grading untouched)
+        judge_fn=_case_judge_fn(args, case, block),
     )
 
     # byte-compare lane: for each unique (commit, ref, sha256) the
