@@ -316,3 +316,60 @@ def test_battery_grade_json_gate_verdict_one_fail():
     assert g["gate_verdict"] == "FAIL"
     assert g["cases_passed"] == 4
     assert g["cases_total"] == 5
+
+
+# ---------------------------------------------------------------------------
+# grade-case since_iso anchoring (oc3 fix: battery mode anchors the
+# census/attestation window to the reasoning-phase restart)
+# ---------------------------------------------------------------------------
+
+def _write_setup_json(run_id, name, restarted_at):
+    rd = rb.RESULTS_DIR / run_id
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / f"{name}.json").write_text(
+        json.dumps({"restarted_at": restarted_at}), encoding="utf-8")
+
+
+def test_grade_case_since_iso_battery_anchors_to_reasoning_restart():
+    """Battery case: NO setup-case JSONs are present, the
+    setup-reasoning-case JSON IS present -> since_iso anchors to the
+    reasoning-phase restart (NOT now) — the [now, now] empty-window
+    defect (oc3-battery-20261108: blocking Q_NOT_IN_HISTORY on every
+    battery case) must not regress."""
+    run_id = "t-battery-since-iso"
+    case = "stars-claim"
+    reasoning_restart = "2026-11-08T09:00:00Z"
+    # battery mode writes ONLY the reasoning-phase setup JSON
+    _write_setup_json(run_id, f"setup-reasoning-case-{case}",
+                      reasoning_restart)
+    rd = rb.RESULTS_DIR / run_id
+    assert not (rd / f"setup-case-{case}.json").exists()
+    assert not (rd / "setup-case-extract.json").exists()
+    saved_now = rb._now_iso
+    rb._now_iso = lambda: "2026-11-08T12:00:00Z"
+    try:
+        assert rb._case_since_iso(rd, case) == reasoning_restart
+    finally:
+        rb._now_iso = saved_now
+
+
+def test_grade_case_since_iso_standard_anchor_unchanged():
+    """Standard case: setup-case JSONs exist -> since_iso anchors to the
+    setup-case extract restart exactly as before (the battery fallback is
+    unreachable when the standard setup-case JSONs are present)."""
+    run_id = "t-standard-since-iso"
+    case = "original"
+    extract_restart = "2026-11-08T08:00:00Z"
+    reasoning_restart = "2026-11-08T09:00:00Z"
+    _write_setup_json(run_id, "setup-case-extract", extract_restart)
+    _write_setup_json(run_id, f"setup-case-{case}", extract_restart)
+    _write_setup_json(run_id, f"setup-reasoning-case-{case}",
+                      reasoning_restart)
+    rd = rb.RESULTS_DIR / run_id
+    saved_now = rb._now_iso
+    rb._now_iso = lambda: "2026-11-08T12:00:00Z"
+    try:
+        # extract restart wins even though the reasoning JSON is present
+        assert rb._case_since_iso(rd, case) == extract_restart
+    finally:
+        rb._now_iso = saved_now
