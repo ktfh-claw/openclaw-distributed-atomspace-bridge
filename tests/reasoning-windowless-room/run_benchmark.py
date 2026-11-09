@@ -380,7 +380,46 @@ def _facts_mod():
     return facts_mod
 
 
-def _case_by_id(case_id: str) -> dict | None:
+# oc3 audit R2 (specs/oc3-research-audit-mode/spec.md): --battery
+# accepts the built-in id 'battery' (BATTERY_CASES, byte-compatible) OR
+# a filesystem path to a question-pack/1 JSON file (question_pack.py
+# loads + validates: unique kebab-case ids, non-empty questions,
+# collision guard vs the frozen TEST_CASES ids and the built-in
+# BATTERY_CASES ids; an absent expected_answer selects the faithfulness
+# judge, R3). External packs run exactly like the built-in battery —
+# no cleanup-das, no extraction (live-KB reuse).
+BATTERY_PACK_ID = "battery"
+
+_PACK_CACHE: dict[str, dict] = {}
+
+
+def _load_battery_pack(battery: str) -> dict:
+    """Load + validate an external question pack (memoized per path for
+    the run); returns the normalized pack dict (question_pack.load_pack
+    raises question_pack.QuestionPackError — a ValueError — with a
+    clear one-line cause on any invalid pack)."""
+    if battery not in _PACK_CACHE:
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
+        import question_pack
+        facts_mod = _facts_mod()
+        _PACK_CACHE[battery] = question_pack.load_pack(
+            battery,
+            test_case_ids=[c["id"] for c in facts_mod.TEST_CASES],
+            battery_case_ids=[c["id"] for c in facts_mod.BATTERY_CASES],
+        )
+    return _PACK_CACHE[battery]
+
+
+def _pack_cases(battery: str) -> list[dict]:
+    """The external question-pack case dicts for --battery <path> (''
+    and the built-in id resolve to NO pack)."""
+    if not battery or battery == BATTERY_PACK_ID:
+        return []
+    return list(_load_battery_pack(battery)["cases"])
+
+
+def _case_by_id(case_id: str, battery: str = "") -> dict | None:
     for c in _facts_mod().TEST_CASES:
         if c["id"] == case_id:
             return c
@@ -390,6 +429,12 @@ def _case_by_id(case_id: str) -> dict | None:
     # TEST_CASES entries; standard ids always resolve from TEST_CASES
     # first, so the 3-case flow is unchanged)
     for c in _facts_mod().BATTERY_CASES:
+        if c["id"] == case_id:
+            return c
+    # oc3 audit R2: external question-pack cases resolve LAST (pack ids
+    # are collision-guarded against both frozen id sets at load time,
+    # so no shadowing is possible)
+    for c in _pack_cases(battery):
         if c["id"] == case_id:
             return c
     return None
@@ -1956,7 +2001,9 @@ def setup_case(args, phase: str = None) -> int:
         # renderer ignores it).
         case = None
     else:
-        case = _case_by_id(args.case)
+        # oc3 audit R2: an external pack path resolves pack case ids
+        # ('' and 'battery' resolve no pack — standard/built-in only)
+        case = _case_by_id(args.case, getattr(args, "battery", ""))
         if case is None:
             print(f"[setup-case] ERROR: unknown case id {args.case}")
             return GATE_ERROR
@@ -2420,7 +2467,7 @@ def snapshot_phase1_logs(args) -> int:
 def agent_case(args) -> int:
     """Wait for THIS case's FINAL ANSWER line in answers.md."""
     profile = _profile(args)
-    case = _case_by_id(args.case)
+    case = _case_by_id(args.case, getattr(args, "battery", ""))
     if case is None:
         return GATE_ERROR
     paths = _bench_paths(args)
@@ -2709,7 +2756,7 @@ def grade_case(args) -> int:
     import grading as grading_mod
     import history_parse
 
-    case = _case_by_id(args.case)
+    case = _case_by_id(args.case, getattr(args, "battery", ""))
     if case is None:
         return GATE_ERROR
     _resolve_endpoints(args)
@@ -3176,34 +3223,52 @@ def full_shared_kb(args) -> int:
 
 
 def full_battery(args) -> int:
-    """oc3 --battery mode (spec: specs/oc3-reasoning-battery/spec.md):
-    the 5 additional reasoning cases (the "manual reasoning questions")
-    run against the ALREADY-EXTRACTED live KB in DAS — NO shared
-    extraction and NO cleanup-das (the live KB must be preserved for
-    subsequent battery runs and the oc3 series; the preflight probes
-    the read-proxy for a windowless-room fact and aborts with a clear
-    error if the KB is absent).
+    """oc3 --battery mode (spec: specs/oc3-reasoning-battery/spec.md;
+    oc3 audit R2: specs/oc3-research-audit-mode/spec.md): the battery
+    cases — the 5 built-in "manual reasoning questions" (BATTERY_CASES)
+    OR the cases of an external question-pack/1 JSON file — run against
+    the ALREADY-EXTRACTED live KB in DAS — NO shared extraction and NO
+    cleanup-das (the live KB must be preserved for subsequent battery
+    runs and the oc3 series; the preflight probes the read-proxy for a
+    windowless-room fact and aborts with a clear error if the KB is
+    absent).
 
     Flow: preflight (standard env checks + the battery live-KB probe)
-    -> PER BATTERY CASE (the 5 BATTERY_CASES): reasoning-phase restart
-    (fresh per-case session, oc2 C6 pattern wr-<run>-case-<case>) ->
-    answer wait (stall watchdog) -> grade -> report -> teardown. The
-    per-case flow is identical to the standard per-case reasoning
-    flow; the battery cases are just different case ids. The on-disk
-    extraction record (facts-index.md) is NOT reset — the battery
-    reuses the live KB's record left by the prior extraction run (the
-    E-gate checks the battery cases' FACTS lines against it); only
-    answers.md starts fresh per battery run."""
+    -> PER BATTERY CASE: reasoning-phase restart (fresh per-case
+    session, oc2 C6 pattern wr-<run>-case-<case>) -> answer wait
+    (stall watchdog) -> grade -> report -> teardown. The per-case flow
+    is identical to the standard per-case reasoning flow; the battery
+    cases are just different case ids. The on-disk extraction record
+    (facts-index.md) is NOT reset — the battery reuses the live KB's
+    record left by the prior extraction run (the E-gate checks the
+    battery cases' FACTS lines against it); only answers.md starts
+    fresh per battery run.
+
+    oc3 audit R2: --battery <path> loads the external pack up-front
+    (question_pack.load_pack validates: unique kebab-case ids,
+    non-empty questions, collision guard vs the frozen TEST_CASES ids
+    and the built-in BATTERY_CASES ids); an invalid pack is a clear
+    harness error BEFORE any live phase runs. External packs get the
+    same live-KB reuse — no cleanup-das, no extraction."""
     facts_mod = _facts_mod()
-    battery_ids = [c["id"] for c in facts_mod.BATTERY_CASES]
     gate_exit = GATE_PASS
     harness_error = False
 
     battery_name = getattr(args, "battery", "")
-    if battery_name and battery_name != "battery":
-        print(f"[full] ERROR: unknown battery: {battery_name!r} "
-              f"(valid: battery)")
-        return GATE_ERROR
+    battery_pack: dict | None = None
+    if battery_name and battery_name != BATTERY_PACK_ID:
+        try:
+            battery_pack = _load_battery_pack(battery_name)
+        except ValueError as e:
+            print(f"[full] ERROR: invalid question pack {battery_name!r}: {e}")
+            return GATE_ERROR
+        battery_ids = [c["id"] for c in battery_pack["cases"]]
+        print(f"[full] battery: external question pack {battery_name!r}"
+              + (f" ({battery_pack['name']})" if battery_pack.get("name")
+                 else "")
+              + f" — {len(battery_ids)} case(s): {battery_ids}")
+    else:
+        battery_ids = [c["id"] for c in facts_mod.BATTERY_CASES]
 
     print("\n[battery] === preflight (standard env checks + live-KB probe) ===")
     rc = preflight(args)
@@ -3266,6 +3331,11 @@ def full_battery(args) -> int:
         "cases_passed": cases_passed,
         "cases_total": len(battery_ids),
         "adherence_clean_cases": adherence_clean,
+        # oc3 audit R2: provenance of the case set — None for the
+        # built-in battery, the pack's path/name for an external pack
+        "battery_pack": ({"path": battery_pack["source_path"],
+                          "name": battery_pack.get("name")}
+                         if battery_pack is not None else None),
         "per_case": per_case,
         "timestamp": _now_iso(),
     }
@@ -3744,13 +3814,19 @@ def build_parser() -> argparse.ArgumentParser:
     # specs/oc3-reasoning-battery/spec.md) — 5 additional reasoning
     # cases against the ALREADY-EXTRACTED live KB in DAS (no shared
     # extraction, no cleanup-das; preflight probes the read-proxy for
-    # the KB and aborts if absent)
+    # the KB and aborts if absent). oc3 audit R2: the value is EITHER
+    # the built-in id 'battery' OR a path to a question-pack/1 JSON
+    # file (question_pack.py validates).
     fp.add_argument("--battery", default="", metavar="BATTERY",
-                    help="oc3: run the reasoning battery (the 5 manual "
-                         "reasoning questions) against the ALREADY-"
-                         "EXTRACTED live KB in DAS — no shared "
+                    help="oc3: run the reasoning battery against the "
+                         "ALREADY-EXTRACTED live KB in DAS — no shared "
                          "extraction, no cleanup-das (the live KB is "
-                         "reused and preserved)")
+                         "reused and preserved). Accepts the built-in "
+                         "id 'battery' (the 5 manual reasoning "
+                         "questions) OR a path to a question-pack/1 "
+                         "JSON file (external research questions; an "
+                         "absent expected_answer selects the "
+                         "faithfulness judge)")
     fp.add_argument("--two-phase", action="store_true",
                     help="DEPRECATED no-op alias (oc2): the default full path "
                          "is already the shared-KB two-phase flow (ONE "

@@ -141,7 +141,10 @@ def test_grade_case_persists_census_before_reconstruction_failure():
     try:
         with tempfile.TemporaryDirectory() as root:
             run_benchmark.RESULTS_DIR = Path(root)
-            run_benchmark._case_by_id = lambda case_id: {"id": case_id}
+            # oc3 audit R2: _case_by_id gained the optional battery arg
+            # (pack path-or-'battery'; '' keeps the standard resolution)
+            run_benchmark._case_by_id = (
+                lambda case_id, battery="": {"id": case_id})
             run_benchmark._resolve_endpoints = lambda args: None
             run_benchmark._bench_paths = lambda args: {
                 "answers": "answers", "history": "history", "vol": Path(root),
