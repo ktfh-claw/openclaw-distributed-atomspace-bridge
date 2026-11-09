@@ -2685,6 +2685,22 @@ def _get_judge(args):
     return _lazy_judge
 
 
+def _case_since_iso(rd: Path, case: str) -> str:
+    """The census/attestation window start for a case (oc3 fix): the
+    run-level extraction restart (setup-case-extract.json, standard
+    flow), else the case's own setup restart (setup-case-<case>.json,
+    standard flow), else the case's reasoning-phase restart
+    (setup-reasoning-case-<case>.json, battery flow — battery mode
+    writes no setup-case JSONs), else now."""
+    setup_json = (_load_json(
+        rd / f"setup-case-{EXTRACT_PSEUDO_CASE}.json")
+        or _load_json(rd / f"setup-case-{case}.json") or {})
+    reasoning_json = _load_json(
+        rd / f"setup-reasoning-case-{case}.json") or {}
+    return (setup_json.get("restarted_at")
+            or reasoning_json.get("restarted_at") or _now_iso())
+
+
 def grade_case(args) -> int:
     """Grade ONE case independently (A/Q/E/R/P gate; A-substance via the
     LLM judge, everything else deterministic; P from the Phase-4
@@ -2737,10 +2753,15 @@ def grade_case(args) -> int:
     # merged into the census. The Q-gate attestation lane reads the
     # PERSISTENT read-proxy / query-engine logs, which survive agent
     # restarts, so it keeps the full case window [extraction restart, now].
-    setup_json = (_load_json(
-        rd / f"setup-case-{EXTRACT_PSEUDO_CASE}.json")
-        or _load_json(rd / f"setup-case-{args.case}.json") or {})
-    since_iso = setup_json.get("restarted_at") or _now_iso()
+    # oc3 fix: battery cases write NO setup-case JSONs, so the standard
+    # chain (extract pseudo-case first, then the case itself) falls
+    # through to _now_iso() — a [now, now] census/attestation window that
+    # can never contain the agent's retrieve calls. Anchor the window to
+    # the case's REASONING-phase restart when a setup-reasoning-case JSON
+    # is present (battery mode); the standard 3-case flow is unchanged
+    # (its setup-case JSONs always exist, so the fallback is unreachable
+    # there).
+    since_iso = _case_since_iso(rd, args.case)
     phase1_log_path = rd / "windows" / EXTRACT_PSEUDO_CASE / PHASE1_LOG_BASENAME
     phase1_logs = ""
     if phase1_log_path.is_file():
