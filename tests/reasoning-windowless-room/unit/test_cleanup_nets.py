@@ -4,7 +4,9 @@
 N1 rewire: the discovery net is a mongo $or over
 custom_attributes.provenance_ref (v4 writes — the ref IS the source URL,
 D5) and custom_attributes.provenance_url (pre-migration v2.1 residue),
-both $regex-matched against facts.SOURCE_URL_BASE — catches v4 writes
+both $regex-matched against the benchmark corpus URL bases (the
+windowless-room background base facts.SOURCE_URL_BASE and — ai-act
+campaign — the corpus/aiact raw-ref base) — catches v4 writes
 AND legacy residue; N2 (benchmark-only literals) is untouched and the
 union/dedupe behavior is preserved.
 
@@ -160,16 +162,20 @@ class FakeMongo:
                    and any(t in fact_syms for t in d["targets"])]
             return json.dumps(out) + "\n"
         if '"custom_attributes.provenance_ref"' in js:
-            # N1: $or over provenance_ref (v4) + provenance_url (legacy)
+            # N1: $or over provenance_ref (v4) + provenance_url (legacy).
+            # ai-act campaign: each $regex is an alternation of BOTH
+            # benchmark corpus URL bases (the windowless-room background
+            # and the aiact corpus) — residue of either corpus is swept.
             bases = [json.loads(m) for m in
                      re.findall(r'\{\$regex: ("[^"]*")\}', js)]
             assert len(bases) == 2, bases
-            assert all(b == SOURCE_URL_BASE for b in bases), bases
+            alts = {a for b in bases for a in b.split("|")}
+            assert alts == {SOURCE_URL_BASE, rb.AIACT_SOURCE_URL_BASE}, bases
             out = [d["custom_attributes"]["metta_expression"]
                    for d in self.links
-                   if any((d.get("custom_attributes") or {}).get(k, "").find(b) >= 0
+                   if any((d.get("custom_attributes") or {}).get(k, "").find(a) >= 0
                           for k in ("provenance_ref", "provenance_url")
-                          for b in bases)]
+                          for a in alts)]
             return json.dumps(out) + "\n"
         if '"custom_attributes.metta_expression"' in js:
             # N2: benchmark-only literal net (untouched)

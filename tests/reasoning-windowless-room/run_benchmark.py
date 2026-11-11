@@ -390,6 +390,68 @@ def _facts_mod():
 # no cleanup-das, no extraction (live-KB reuse).
 BATTERY_PACK_ID = "battery"
 
+
+# ---------------------------------------------------------------------------
+# ai-act corpus mode (owner directive 2026-11-11 23:07 UTC; campaign
+# memory/ai-act-extraction-20261112): --corpus aiact switches the
+# shared-extraction corpus from the windowless-room background files to
+# the EU AI Act Articles 1-15 corpus (Decodo markdown scraped from
+# artificialintelligenceact.eu, committed on THIS branch under
+# corpus/aiact/). The agent cites the raw.githubusercontent refs of the
+# committed corpus files — the write-bridge fetches the ref, so
+# provenance hashes exactly the corpus bytes the agent extracted from.
+# The corpus switch only redirects: (a) the benchmark background dir,
+# (b) urls.txt, (c) the extraction prompt (aiact template, per-
+# paragraph pipeline), (d) the battery live-KB probe (broad patterns
+# instead of the windowless-room fact), (e) the P-gate informational
+# case source set + reconstruction/byte-compare background dir, and
+# (f) the preflight canary requirement (the campaign DB starts EMPTY by
+# design — Phase 1 of the campaign dropped and recreated the das DB).
+# Grading, gates, receipt census, and provenance chain are unchanged.
+# ---------------------------------------------------------------------------
+CORPUS_AIACT = "aiact"
+AIACT_SOURCE_URL_BASE = (
+    "https://raw.githubusercontent.com/ktfh-claw/"
+    "openclaw-distributed-atomspace-bridge/"
+    "ai-act-extraction-campaign/tests/reasoning-windowless-room/corpus/aiact")
+# The corpus live-KB probe: extraction predicates are agent-chosen, so
+# no single fact is guaranteed present. Broad variable-only patterns
+# match ANY stored Inheritance/Evaluation atom — a non-empty KB
+# resolves at least one (the same contract as the windowless-room
+# probe: count > 0 = KB present).
+AIACT_KB_PROBE_QUERIES = [
+    "(Inheritance $X $Y)",
+    "(Evaluation $P $A $B)",
+]
+
+
+def _corpus(args) -> str:
+    """Active corpus mode ('' = the standard windowless-room corpus)."""
+    return getattr(args, "corpus", "") or ""
+
+
+def _corpus_dir(args) -> Path | None:
+    """The corpus source dir (None in the standard mode)."""
+    if _corpus(args) != CORPUS_AIACT:
+        return None
+    return HERE / "corpus" / CORPUS_AIACT
+
+
+def _corpus_source_urls(args) -> dict[str, str] | None:
+    """Corpus file name -> provenance URL map (None in the standard
+    mode — facts.SOURCE_URLS is the standard map)."""
+    corpus_dir = _corpus_dir(args)
+    if corpus_dir is None:
+        return None
+    return {f.name: f"{AIACT_SOURCE_URL_BASE}/{f.name}"
+            for f in sorted(corpus_dir.glob("*.md"))}
+
+
+def _background_dir(args) -> Path:
+    """The background/corpus source dir the harness copies into the
+    benchmark dir and the reconstruction script resolves refs against."""
+    return _corpus_dir(args) or (HERE / "background")
+
 _PACK_CACHE: dict[str, dict] = {}
 
 
@@ -1065,7 +1127,26 @@ def _battery_kb_probe(args) -> str:
     (the live KB the battery reuses). Returns the preflight check
     value: 'count=<n>' when the probe resolved (count > 0 = KB
     present), 'absent' when the KB is not present, 'error: ...' on a
-    probe failure."""
+    probe failure.
+
+    Corpus mode (aiact): extraction predicates are agent-chosen, so no
+    single fact is guaranteed present; the probe issues the broad
+    variable-only patterns (any stored Inheritance/Evaluation atom
+    resolves) and sums the counts."""
+    if _corpus(args) == CORPUS_AIACT:
+        total = 0
+        errors: list[str] = []
+        for query in AIACT_KB_PROBE_QUERIES:
+            try:
+                resp = _http_post(args.read_proxy + "/v1/query", {
+                    "metta": query, "max_answers": 10,
+                }, timeout=30.0)
+                total += int(resp.get("count", 0) or 0)
+            except Exception as e:
+                errors.append(str(e))
+        if total > 0:
+            return f"count={total}"
+        return f"error: {'; '.join(errors)}" if errors else "absent"
     try:
         resp = _http_post(args.read_proxy + "/v1/query", {
             "metta": BATTERY_KB_PROBE_QUERY, "max_answers": 10,
@@ -1239,14 +1320,23 @@ def preflight(args) -> int:
             # chroma memory).
             _preflight_openclaw_checks(args, profile, checks)
 
-        # v3: canary fact must resolve BEFORE the run (campaign atoms intact)
-        try:
-            resp = _http_post(args.read_proxy + "/v1/query", {
-                "metta": '(Inheritance (Concept "Fetch.ai") $X)', "max_answers": 10,
-            }, timeout=30.0)
-            checks["canary_fetch_ai"] = f"count={resp.get('count', '?')}"
-        except Exception as e:
-            checks["canary_fetch_ai"] = f"error: {e}"
+        # v3: canary fact must resolve BEFORE the run (campaign atoms
+        # intact). Corpus mode (aiact) EXEMPTION: the campaign DB starts
+        # EMPTY by design (Phase 1 dropped + recreated the das database),
+        # so the Fetch.ai canary atoms are absent through no fault of
+        # the deployment — the corpus run seeds its own KB.
+        if _corpus(args) == CORPUS_AIACT:
+            checks["canary_fetch_ai"] = ("ok (corpus aiact: campaign DB "
+                                         "starts empty by design — canary "
+                                         "not required)")
+        else:
+            try:
+                resp = _http_post(args.read_proxy + "/v1/query", {
+                    "metta": '(Inheritance (Concept "Fetch.ai") $X)', "max_answers": 10,
+                }, timeout=30.0)
+                checks["canary_fetch_ai"] = f"count={resp.get('count', '?')}"
+            except Exception as e:
+                checks["canary_fetch_ai"] = f"error: {e}"
 
         # oc3 --battery: the live KB must be present — probe the
         # read-proxy for at least one windowless-room fact (spec R2).
@@ -1341,14 +1431,21 @@ def _discover_benchmark_expressions() -> list[str]:
     Campaign atoms, canaries, and x402/fetch facts match NEITHER net.
     """
     facts = _facts_mod()
-    url_base = facts.SOURCE_URL_BASE
+    # corpus mode residue: both URL bases — the windowless-room
+    # background refs AND the aiact corpus refs (campaign re-runs must
+    # sweep the corpus KB the same way; campaign atoms/canaries match
+    # neither — the aiact base is a benchmark-corpus-only path). The
+    # bases are joined RAW (not re.escape'd) — the frozen N1 net always
+    # matched the plain URL string; dots matching any char is the
+    # accepted historical looseness.
+    url_regex = f"{facts.SOURCE_URL_BASE}|{AIACT_SOURCE_URL_BASE}"
 
     js_n1 = (
         'const out = db.links.find({$or: '
         '[{"custom_attributes.provenance_ref": '
-        '{$regex: ' + json.dumps(url_base) + '}}, '
+        '{$regex: ' + json.dumps(url_regex) + '}}, '
         '{"custom_attributes.provenance_url": '
-        '{$regex: ' + json.dumps(url_base) + '}}]}).toArray();'
+        '{$regex: ' + json.dumps(url_regex) + '}}]}).toArray();'
         'print(JSON.stringify(out.map(d => d.custom_attributes.metta_expression)));'
     )
     n1_raw = _mongo_eval(js_n1)
@@ -1754,12 +1851,31 @@ def _render_extraction_prompt(args, case: dict) -> str:
     extraction context, names the corpus sources once. The ``case``
     parameter is retained for call-site compatibility (the v2 per-case
     rendering); its question is NOT rendered — the shared prompt carries
-    every case's question."""
-    profile = _profile(args)
-    template = (HERE / "agent_extraction_prompt_template.md").read_text(encoding="utf-8")
+    every case's question.
+
+    Corpus mode (aiact): the corpus template
+    (agent_extraction_prompt_template_aiact.md) carries the per-
+    paragraph extraction pipeline; the {{ALL_QUESTIONS}} extraction
+    context comes from the battery pack (external pack when
+    --battery <path> is bound, the built-in BATTERY_CASES for the
+    built-in id) — the standard mode is byte-identical to before."""
     facts_mod = _facts_mod()
-    all_questions = "\n".join(f"- {c['question']}"
-                              for c in facts_mod.TEST_CASES)
+    if _corpus(args) == CORPUS_AIACT:
+        template_name = "agent_extraction_prompt_template_aiact.md"
+        battery = getattr(args, "battery", "")
+        context_cases = (_pack_cases(battery)
+                         if battery and battery != BATTERY_PACK_ID
+                         else facts_mod.BATTERY_CASES)
+        all_questions = "\n".join(f"- {c['question']}" for c in context_cases)
+        if not all_questions:
+            all_questions = ("- (no question pack bound — extract the full "
+                             "corpus faithfully, paragraph by paragraph)")
+    else:
+        template_name = "agent_extraction_prompt_template.md"
+        all_questions = "\n".join(f"- {c['question']}"
+                                  for c in facts_mod.TEST_CASES)
+    profile = _profile(args)
+    template = (HERE / template_name).read_text(encoding="utf-8")
     return _apply_profile_prompt_paths((template
             .replace("{{RUN_ID}}", args.run_id)
             .replace("{{ALL_QUESTIONS}}", all_questions)
@@ -2002,9 +2118,18 @@ def _prepare_benchmark_dir(args) -> None:
     paths = _bench_paths(args)
     facts_mod = _facts_mod()
     _sudo_run(["mkdir", "-p", str(paths["bench"] / "background")])
-    for f in sorted((HERE / "background").glob("*.md")):
+    # corpus mode (aiact): the corpus dir replaces the windowless-room
+    # background dir; urls.txt carries the corpus files' committed raw
+    # refs (the write-bridge fetches those refs — provenance hashes the
+    # exact corpus bytes). The staged dir name stays "background" so
+    # every downstream path (profile rel paths, reconstruct_sources.py
+    # --background-dir, agent instructions) is untouched.
+    for f in sorted(_background_dir(args).glob("*.md")):
         _sudo_run(["cp", str(f), str(paths["bench"] / "background" / f.name)])
-    _sudo_write(paths["urls"], "\n".join(facts_mod.SOURCE_URLS.values()) + "\n")
+    corpus_urls = _corpus_source_urls(args)
+    url_values = (corpus_urls.values() if corpus_urls is not None
+                  else facts_mod.SOURCE_URLS.values())
+    _sudo_write(paths["urls"], "\n".join(url_values) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -2624,11 +2749,16 @@ RECONSTRUCT_SCRIPT = (Path(__file__).resolve().parents[2]
 RECONSTRUCTION_TIMEOUT = 300.0
 
 
-def _case_source_refs(case_id: str) -> set[str]:
+def _case_source_refs(args, case_id: str) -> set[str]:
     """The case's allowed source refs: the background SOURCE_URLS of the
     canonical facts the case requires (gate_case compares the
     reconstruction's stored refs against this set for the informational
-    P_SOURCE_SET_MISMATCH)."""
+    P_SOURCE_SET_MISMATCH). Corpus mode (aiact): every corpus URL is a
+    valid source for any case — extraction predicates cite the article
+    the paragraph came from, and a pack case draws on any article."""
+    corpus_urls = _corpus_source_urls(args)
+    if corpus_urls is not None:
+        return set(corpus_urls.values())
     facts_mod = _facts_mod()
     return {facts_mod.SOURCE_URLS[f["source_file"]]
             for f in facts_mod.CANONICAL_FACTS
@@ -2663,7 +2793,7 @@ def _run_reconstruction(args, case_id: str, block, artifacts_dir: Path) -> dict 
         "--case", case_id,
         "--json", str(json_out),
         "--source-paths-out", str(paths_out),
-        "--background-dir", str(HERE / "background"),
+        "--background-dir", str(_background_dir(args)),
         "--mongo-container", CONTAINER_MONGODB,
     ]
     try:
@@ -2723,17 +2853,19 @@ def _byte_compare_rows(payload: dict,
     return rows
 
 
-def _reconstruction_lane(payload: dict | None) -> dict | None:
+def _reconstruction_lane(payload: dict | None,
+                          background_dir: Path | None = None) -> dict | None:
     """grade_data["reconstruction"] view (None when the case block was
     missing). script_exit mirrors the script's own exit rule
     (reconstruct_sources.py: 2 iff any blocking condition, else 0; H_*
-    never affect it — D4)."""
+    never affect it — D4). background_dir routes the byte-compare lane
+    at the active corpus (aiact) or the windowless-room background."""
     if payload is None:
         return None
     return {
         "script_exit": 2 if payload.get("conditions") else 0,
         "payload": payload,
-        "byte_compare": _byte_compare_rows(payload),
+        "byte_compare": _byte_compare_rows(payload, background_dir),
     }
 
 
@@ -2987,7 +3119,7 @@ def grade_case(args) -> int:
     r = grading_mod.gate_case(
         case, block, history_queries, placeholder_calls, reissue,
         reconstruction=recon_payload,
-        case_source_refs=_case_source_refs(args.case),
+        case_source_refs=_case_source_refs(args, args.case),
         facts_index=facts_index,
         window_persist_receipts=window_receipt_count,
         attestation=attestation,
@@ -3003,7 +3135,8 @@ def grade_case(args) -> int:
     # reconstruction chain found, hash the background file the ref names
     # and compare it to the entry's sha256 (evidence, not a condition —
     # a failed resolution already blocks via P_UNRESOLVED)
-    reconstruction_lane = _reconstruction_lane(recon_payload)
+    reconstruction_lane = _reconstruction_lane(
+        recon_payload, background_dir=_background_dir(args))
 
     grade_data = {
         "run_id": args.run_id,
@@ -3188,6 +3321,11 @@ def full_shared_kb(args) -> int:
     """
     facts_mod = _facts_mod()
     all_ids = [c["id"] for c in facts_mod.TEST_CASES]
+    extraction_only = bool(getattr(args, "extraction_only", False))
+    if extraction_only:
+        print(f"[full] --extraction-only: the shared EXTRACTION phase "
+              f"(corpus {(_corpus(args) or 'standard')}) builds the KB; "
+              f"per-case reasoning phases are skipped")
     if getattr(args, "cases", ""):
         wanted = [c.strip() for c in args.cases.split(",") if c.strip()]
         unknown = [c for c in wanted if c not in all_ids]
@@ -3273,7 +3411,7 @@ def full_shared_kb(args) -> int:
                       "(each case graded truthfully on the current state)")
 
     per_case = {}
-    if not harness_error:
+    if not harness_error and not extraction_only:
         for case_id in case_ids:
             print(f"\n[full] === CASE {case_id} (REASONING) ===")
             args.case = case_id  # per-case phases read args.case
@@ -3310,8 +3448,12 @@ def full_shared_kb(args) -> int:
                           if not v.get("adherence_conditions"))
     summary = {
         "run_id": args.run_id,
-        "mode": "shared-kb",
-        "gate_verdict": "PASS" if (cases_passed == len(case_ids) and not harness_error) else "FAIL",
+        "mode": ("extraction-only" if extraction_only
+                 else "shared-kb"),
+        "corpus": (_corpus(args) or "standard"),
+        "gate_verdict": ("PASS" if ((cases_passed == len(case_ids)
+                                     or extraction_only)
+                                    and not harness_error) else "FAIL"),
         "cases_passed": cases_passed,
         "cases_total": len(case_ids),
         "adherence_clean_cases": adherence_clean,
@@ -3557,12 +3699,13 @@ def grade(args) -> int:
             _write_json(rd / "grade.json", {"error": str(e)})
             return GATE_ERROR
         if recon_payload is not None:
-            reconstruction_by_case[case_id] = _reconstruction_lane(recon_payload)
+            reconstruction_by_case[case_id] = _reconstruction_lane(
+                recon_payload, background_dir=_background_dir(args))
         r = grading_mod.gate_case(
             case, block, history_queries, placeholder_calls,
             reissue,
             reconstruction=recon_payload,
-            case_source_refs=_case_source_refs(case_id),
+            case_source_refs=_case_source_refs(args, case_id),
             facts_index=facts_index,
             window_persist_receipts=len(persist_receipts),
             facts_index_raw=facts_index_text,
@@ -3861,6 +4004,18 @@ def build_parser() -> argparse.ArgumentParser:
                        help="judge API key; default: ASIONE_API_KEY/OPENAI_API_KEY "
                             "env or the Omega deployment runtime.env (never logged)")
         p.add_argument("--judge-timeout", type=float, default=60.0)
+        # ai-act campaign: --corpus switches the shared-extraction
+        # corpus ('' = the windowless-room background files, byte-
+        # identical to before; 'aiact' = the EU AI Act Articles 1-15
+        # files under corpus/aiact/ — committed Decodo markdown whose
+        # raw.githubusercontent refs are the provenance sources)
+        p.add_argument("--corpus", default="", choices=(CORPUS_AIACT,),
+                       help="corpus mode: 'aiact' switches the shared "
+                            "extraction corpus to the EU AI Act Articles "
+                            "1-15 files (corpus/aiact/ — committed "
+                            "Decodo markdown; the agent cites the corpus "
+                            "files' raw.githubusercontent URLs as "
+                            "provenance refs)")
         return p
 
     add_common(subparsers.add_parser("preflight"))
@@ -3970,6 +4125,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="keep the full serialized history (v3 behavior); "
                          "default trims history.metta to the per-case window "
                          "marker before each case (v4)")
+    fp.add_argument("--extraction-only", action="store_true",
+                    help="corpus campaigns: run preflight + cleanup-das + "
+                         "the ONE run-level shared EXTRACTION phase and skip "
+                         "the per-case reasoning phases (the KB is built "
+                         "here; a later --battery run grades it)")
     fp.add_argument("--skip-report", action="store_true")
     fp.add_argument("--allow-dirty-backup", action="store_true")
     fp.add_argument("--keep-snapshots", action="store_true")
@@ -4011,9 +4171,13 @@ def main() -> int:
     if args.phase == "full":
         if getattr(args, "batch", False):
             return full_batch(args)
-        if getattr(args, "battery", ""):
+        if getattr(args, "battery", "") and not getattr(
+                args, "extraction_only", False):
             # oc3: the reasoning-battery mode — no shared extraction, no
-            # cleanup-das (the live KB is reused and preserved)
+            # cleanup-das (the live KB is reused and preserved).
+            # --extraction-only + --battery <pack> runs the SHARED
+            # EXTRACTION with the pack's questions as context (corpus
+            # campaigns build the KB first, then grade via --battery)
             return full_battery(args)
         if not args.cleanup_first:
             # skip cleanup-das by pre-creating its result marker
