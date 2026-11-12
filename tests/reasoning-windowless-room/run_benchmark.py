@@ -2149,6 +2149,21 @@ def _maybe_reissue_delivery(args, session_key: str, stall_seconds: float,
     return ok
 
 
+def _reissue_rate_limited(args, session_key: str,
+                          stall_seconds: float) -> bool:
+    """True when the ONE-re-issue-per-stall-window rate limit is
+    currently blocking a re-issue for this delivery (a re-issue happened
+    less than ``stall_seconds`` ago). Mirrors the rate-limit branch of
+    _maybe_reissue_delivery so callers can distinguish "rate-limited"
+    from "the re-issue attempt itself failed" (campaign tick 11)."""
+    if not stall_seconds > 0:
+        return False
+    key = (args.run_id, session_key)
+    rec = _DELIVERY_PROCS.get(key)
+    return (rec is not None
+            and time.time() - rec.get("last_reissue", 0.0) < stall_seconds)
+
+
 def _delivery_exit(args, session_key: str) -> int | None:
     """The delivery turn's exit code, None while still running (or absent)."""
     rec = _DELIVERY_PROCS.get((args.run_id, session_key))
@@ -2646,9 +2661,13 @@ def _poll_article_checkpoint(args, article_stem: str, since_iso: str,
     _poll_checkpoint_manifest: forward signal = facts-index content
     change or a fresh persist receipt; a stall re-issues the delivery
     turn (rate-limited by the stall window) and keeps polling until the
-    phase timeout; timeout/stall without the line returns found=False
-    (the orchestrator records the article as incomplete and moves on —
-    the next article's restart kills any zombie turn).
+    phase timeout. A rate-LIMITED stall (tick 11: the benign exit-1
+    re-issue already spent the window, the agent turn then stopped
+    prematurely) also keeps polling — the phase timeout bounds the wait;
+    only a genuine re-issue failure aborts early. Timeout without the
+    line returns found=False (the orchestrator records the article as
+    incomplete and moves on — the next article's restart kills any
+    zombie turn).
 
     Returns {"found": bool, "line": str, "elapsed_s": int,
     "timeout_s": float, "poll_interval_s": float, "since_iso": str,
@@ -2703,6 +2722,17 @@ def _poll_article_checkpoint(args, article_stem: str, since_iso: str,
                 if _maybe_reissue_delivery(args, session_key, stall_s,
                                            "article extraction stall"):
                     last_signal = time.time()
+                elif _reissue_rate_limited(args, session_key, stall_s):
+                    # Campaign tick 11 (a06 post-mortem): the benign
+                    # first-delivery exit-1 re-issue spends the SAME
+                    # one-per-window budget, and a premature agent stop
+                    # shortly after it makes the stall fire while the
+                    # rate limit still holds — aborting here (the a06
+                    # failure: 0 receipts, ~10 min of phase budget
+                    # discarded) loses an article the limiter could still
+                    # recover. Keep polling under the phase-timeout cap;
+                    # the limiter re-issues once its window expires.
+                    pass
                 else:
                     stall_aborted = True
                     break

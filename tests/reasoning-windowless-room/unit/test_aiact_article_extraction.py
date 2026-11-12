@@ -262,6 +262,93 @@ def test_poll_article_checkpoint_timeout_not_found():
             setattr(rb, name, value)
 
 
+def test_poll_article_checkpoint_rate_limited_stall_keeps_polling():
+    """Tick-11 regression (a06 post-mortem): the benign first-delivery
+    exit-1 re-issue spends the ONE-per-window budget; when the agent
+    turn then stops prematurely, the stall fires while the rate limit
+    still holds. The poll must NOT abort there — it keeps polling
+    under the phase-timeout cap and finds the boundary when the turn
+    (here: a later manifest write) finally produces it."""
+    state = {"reads": 0}
+
+    def fake_sudo_read(p, timeout=60):
+        state["reads"] += 1
+        base = "ARTICLE-COMPLETE: article-01 2026-11-12T01:00:00Z 5 p\n"
+        # the a06 boundary appears only after ~40ms of dead air (the
+        # rate-limited stall windows must be ridden out, not aborted)
+        if time.time() - T0 < 0.04:
+            return base
+        return base + ("ARTICLE-COMPLETE: article-06 2026-11-12T04:30:00Z"
+                       " 12 p\n")
+
+    def fake_maybe_reissue(args, session_key, stall_seconds, reason):
+        return False  # rate-limited: the exit-1 re-issue spent the window
+
+    T0 = time.time()
+    originals = {name: getattr(rb, name) for name in
+                 ("_checkpoint_dir", "_bench_paths", "_sudo_read",
+                  "_profile", "_maybe_reissue_delivery",
+                  "_reissue_rate_limited", "_delivery_exit",
+                  "_recent_persist_signal", "_memory_volume")}
+    try:
+        rb._checkpoint_dir = lambda args: Path("/nonexistent")
+        rb._bench_paths = lambda args: {"facts_index": Path("/nonexistent")}
+        rb._sudo_read = fake_sudo_read
+        rb._profile = lambda args: rb.OPENCLAW_PROFILE
+        rb._maybe_reissue_delivery = fake_maybe_reissue
+        rb._reissue_rate_limited = lambda a, k, s: True  # rate-limited
+        rb._delivery_exit = lambda args, key: None  # turn still running
+        rb._recent_persist_signal = lambda *a, **k: False
+        rb._memory_volume = lambda args: "/fake/vol"
+        poll = rb._poll_article_checkpoint(
+            _args(case="extract-a06", article_file="article-06.md"),
+            "article-06", "2026-11-12T04:10:00Z",
+            timeout_s=10.0, interval_s=0.001,
+            _sleep=lambda s: None, stall_minutes=0.001)
+        assert poll["found"] is True, \
+            "a rate-limited stall must keep polling, not abort"
+        assert poll["stall_aborted"] is False
+        assert state["reads"] > 1, "the poll loop must have kept iterating"
+    finally:
+        for name, value in originals.items():
+            setattr(rb, name, value)
+
+
+def test_poll_article_checkpoint_reissue_failure_still_aborts():
+    """A stall whose re-issue GENUINELY fails (not rate-limited) still
+    aborts early with stall_aborted=True — the keep-polling relief is
+    only for the rate-limited window collision."""
+    originals = {name: getattr(rb, name) for name in
+                 ("_checkpoint_dir", "_bench_paths", "_sudo_read",
+                  "_profile", "_maybe_reissue_delivery",
+                  "_reissue_rate_limited", "_delivery_exit",
+                  "_recent_persist_signal", "_memory_volume")}
+    try:
+        rb._checkpoint_dir = lambda args: Path("/nonexistent")
+        rb._bench_paths = lambda args: {"facts_index": Path("/nonexistent")}
+        rb._sudo_read = lambda p, timeout=60: ""
+        rb._profile = lambda args: rb.OPENCLAW_PROFILE
+        rb._maybe_reissue_delivery = \
+            lambda a, k, s, reason: False  # re-issue attempt failed
+        rb._reissue_rate_limited = lambda a, k, s: False  # NOT rate-limited
+        rb._delivery_exit = lambda args, key: None
+        rb._recent_persist_signal = lambda *a, **k: False
+        rb._memory_volume = lambda args: "/fake/vol"
+        t0 = time.time()
+        poll = rb._poll_article_checkpoint(
+            _args(case="extract-a06", article_file="article-06.md"),
+            "article-06", "2026-11-12T04:10:00Z",
+            timeout_s=10.0, interval_s=0.001,
+            _sleep=lambda s: None, stall_minutes=0.001)
+        assert poll["found"] is False
+        assert poll["stall_aborted"] is True, \
+            "a genuine re-issue failure must still stall-abort"
+        assert time.time() - t0 < 5.0, "aborted early, not via the timeout"
+    finally:
+        for name, value in originals.items():
+            setattr(rb, name, value)
+
+
 # ---------------------------------------------------------------------------
 # article orchestrator
 # ---------------------------------------------------------------------------
