@@ -2897,6 +2897,7 @@ def agent_case(args) -> int:
         watchdog.register(moved, time.time())
         if watchdog.should_abort(time.time()):
             elapsed = int(time.time() - start)
+            keep_polling = False
             if profile.delivers_agent_turn:
                 # R-A2: the answer block is still absent at the stall
                 # watchdog — re-issue the same delivery (the frozen prompt
@@ -2908,18 +2909,32 @@ def agent_case(args) -> int:
                     watchdog.register(True, time.time())
                     time.sleep(30)
                     continue
-            print(f"[agent-case] STALL WATCHDOG: case {args.case} had no "
-                  f"forward signal for {stall_minutes}m (elapsed {elapsed}s)"
-                  " — aborting case for early investigation")
-            _stop_agent_turn(args, _delivery_session_key(args.case))
-            post = paths["vol"] / f"history.post-case-{args.run_id}-{args.case}.metta"
-            _sudo_run(["cp", str(paths["history"]), str(post)])
-            _write_json(RESULTS_DIR / args.run_id / f"agent-case-{args.case}.json", {
-                "case_id": args.case, "status": "stalled",
-                "elapsed_s": elapsed, "post_snapshot": str(post),
-                "stall_minutes": stall_minutes,
-            })
-            return 1
+                # Campaign tick 21 (battery ai-system-definition
+                # post-mortem): the benign first-delivery exit-1 re-issue
+                # spends the SAME one-per-window budget, and a premature
+                # agent stop shortly after it makes the stall fire while
+                # the rate limit still holds — aborting there (case 1:
+                # 4 retrieves then 15m dead air, aborted at 09:08Z) loses a
+                # case the limiter could still recover. Identical to the
+                # tick-11 a06 article race. Keep polling under the case
+                # wall-clock cap; the limiter re-issues once its window
+                # expires.
+                keep_polling = _reissue_rate_limited(
+                    args, _delivery_session_key(args.case),
+                    stall_minutes * 60)
+            if not keep_polling:
+                print(f"[agent-case] STALL WATCHDOG: case {args.case} had no "
+                      f"forward signal for {stall_minutes}m (elapsed {elapsed}s)"
+                      " — aborting case for early investigation")
+                _stop_agent_turn(args, _delivery_session_key(args.case))
+                post = paths["vol"] / f"history.post-case-{args.run_id}-{args.case}.metta"
+                _sudo_run(["cp", str(paths["history"]), str(post)])
+                _write_json(RESULTS_DIR / args.run_id / f"agent-case-{args.case}.json", {
+                    "case_id": args.case, "status": "stalled",
+                    "elapsed_s": elapsed, "post_snapshot": str(post),
+                    "stall_minutes": stall_minutes,
+                })
+                return 1
         time.sleep(30)
 
     _stop_agent_turn(args, _delivery_session_key(args.case))

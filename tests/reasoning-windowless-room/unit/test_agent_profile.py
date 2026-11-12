@@ -963,3 +963,118 @@ def test_openclaw_teardown_restores_standby_prompt():
     # pre-run history restored from the backup
     assert files["/oc-vol/history.metta"] == '(("old day history"))\n'
     assert restarts == ["openclaw"]
+
+
+# ---------------------------------------------------------------------------
+# Campaign tick 21 (battery case-1 post-mortem): agent_case stall semantics
+# ---------------------------------------------------------------------------
+
+class _FakeTime:
+    """No-op sleep for the 30s poll cadence; real clock otherwise."""
+
+    def __init__(self):
+        import time as _real
+        self._real = _real
+
+    def time(self):
+        return self._real.time()
+
+    def sleep(self, seconds):
+        pass
+
+
+def _agent_case_stall_env(answers_content, writes,
+                          maybe_reissue, rate_limited):
+    """Shared monkeypatch environment for the agent_case stall tests."""
+    answers_path = Path("/fake/answers.md")
+
+    def fake_sudo_read(p, timeout=60):
+        if Path(p) == answers_path:
+            return answers_content()
+        return ""
+
+    paths = {
+        "answers": answers_path,
+        "facts_index": Path("/fake/facts-index.md"),
+        "history": Path("/fake/history.metta"),
+        "vol": Path("/fake/vol"),
+    }
+    return {
+        "_case_by_id": lambda case, battery="": {"id": case},
+        "_bench_paths": lambda args: paths,
+        "_sudo_read": fake_sudo_read,
+        "_profile": lambda args: rb.OPENCLAW_PROFILE,
+        "_delivery_exit": lambda args, key: None,
+        "_maybe_reissue_delivery": maybe_reissue,
+        "_reissue_rate_limited": rate_limited,
+        "_recent_persist_signal": lambda *a, **k: False,
+        "_memory_volume": lambda args: "/fake/vol",
+        "_stop_agent_turn": lambda args, key: None,
+        "_sudo_run": lambda cmd, **kw: None,
+        "_write_json": lambda path, data: writes.append((path, data)),
+    }
+
+
+def test_agent_case_rate_limited_stall_keeps_polling():
+    """Tick-21 regression (battery ai-system-definition post-mortem): the
+    benign first-delivery exit-1 re-issue spends the ONE-per-window budget;
+    when the agent turn then stops prematurely, the stall fires while the
+    rate limit still holds. agent_case must NOT abort there — it keeps
+    polling under the case wall-clock cap and finds the FINAL ANSWER when
+    the re-issued turn (here: a later answers.md write) produces it."""
+    import time as _real
+    t0 = _real.time()
+    state = {"reads": 0}
+
+    def answers_content():
+        state["reads"] += 1
+        # the answer marker appears only after ~40ms of dead air (the
+        # rate-limited stall windows must be ridden out, not aborted)
+        if _real.time() - t0 < 0.04:
+            return ""
+        return ("FINAL ANSWER (ai-system-definition): a machine-based "
+                "system designed to operate with autonomy...\n")
+
+    writes = []
+    env = _agent_case_stall_env(
+        answers_content, writes,
+        maybe_reissue=lambda a, k, s, reason: False,  # rate-limited
+        rate_limited=lambda a, k, s: True)            # limit still holds
+    saved_time = rb.time
+    rb.time = _FakeTime()
+    try:
+        with _Patch(**env):
+            args = _args(agent_profile="openclaw",
+                         case="ai-system-definition",
+                         stall_minutes=0.001, timeout_minutes=1)
+            with redirect_stdout(io.StringIO()):
+                rc = rb.agent_case(args)
+    finally:
+        rb.time = saved_time
+    assert rc == 0, "a rate-limited stall must keep polling, not abort"
+    assert state["reads"] > 1, "the poll loop must have kept iterating"
+    assert writes and writes[-1][1]["status"] == "complete"
+
+
+def test_agent_case_reissue_failure_still_aborts():
+    """A stall whose re-issue GENUINELY fails (not rate-limited) still
+    aborts early with status 'stalled' — the keep-polling relief is only
+    for the rate-limited window collision (tick-21)."""
+    writes = []
+    env = _agent_case_stall_env(
+        lambda: "", writes,
+        maybe_reissue=lambda a, k, s, reason: False,  # attempt failed
+        rate_limited=lambda a, k, s: False)           # NOT rate-limited
+    saved_time = rb.time
+    rb.time = _FakeTime()
+    try:
+        with _Patch(**env):
+            args = _args(agent_profile="openclaw",
+                         case="ai-system-definition",
+                         stall_minutes=0.001, timeout_minutes=1)
+            with redirect_stdout(io.StringIO()):
+                rc = rb.agent_case(args)
+    finally:
+        rb.time = saved_time
+    assert rc == 1
+    assert writes and writes[-1][1]["status"] == "stalled"
