@@ -560,9 +560,10 @@ def test_docker_log_timestamp_parsing():
 # R-A5: preflight (openclaw) — command construction incl. Omega-stopped
 # ---------------------------------------------------------------------------
 
-def _openclaw_preflight(omega_ps_stdout="", extra_run=None):
+def _openclaw_preflight(omega_ps_stdout="", extra_run=None, extra_args=None):
     """Run the openclaw-profile preflight against stubbed subprocess output;
-    return (rc, checks, commands)."""
+    return (rc, checks, commands). extra_args: additional CLI fields
+    merged into the args namespace (e.g. corpus/battery campaign modes)."""
     commands = []
     checks_out = {}
 
@@ -602,7 +603,8 @@ def _openclaw_preflight(omega_ps_stdout="", extra_run=None):
                 _get_judge=fake_judge_getter,
                 _write_json=fake_write_json,
                 _resolve_endpoints=lambda args: None):
-        rc = rb.preflight(_args(agent_profile="openclaw", dry_run=False))
+        rc = rb.preflight(_args(agent_profile="openclaw", dry_run=False,
+                                **(extra_args or {})))
     return rc, checks_out.get("data", {}), commands
 
 
@@ -639,6 +641,43 @@ def test_openclaw_preflight_fails_when_omega_running():
         omega_ps_stdout="omega-curiosity\n")
     assert rc == 1
     assert data["checks"]["omega_agent_stopped"].startswith("RUNNING")
+    assert data["all_ok"] is False
+
+
+def test_openclaw_preflight_aiact_extraction_only_ok_notes_pass():
+    """aiact campaign regression: --corpus aiact + --battery +
+    --extraction-only runs the canary and battery-KB checks as ok-NOTES
+    (the campaign DB starts EMPTY by design — Phase 1 dropped it), and
+    preflight must PASS: all_ok accepts values starting with 'ok' (v16.1).
+    Live-fire evidence: the first aiact-extract launch FAILED preflight
+    because the exact-match ok_values rejected both ok-note values."""
+    rc, data, _ = _openclaw_preflight(
+        extra_args={"corpus": "aiact",
+                    "battery": "/tmp/t-pack.json",
+                    "extraction_only": True})
+    assert rc == 0
+    checks = data["checks"]
+    assert checks["canary_fetch_ai"].startswith("ok (corpus aiact")
+    assert checks["battery_kb_present"].startswith(
+        "ok (--extraction-only")
+    assert data["all_ok"] is True
+
+
+def test_openclaw_preflight_battery_kb_absent_still_fails():
+    """Without --extraction-only, a live-KB-reuse battery run against an
+    EMPTY KB must still FAIL preflight: the probe value 'absent' is not
+    an ok-note, so the v16.1 startswith('ok') acceptance does not mask a
+    genuinely missing KB."""
+    saved = rb._battery_kb_probe
+    rb._battery_kb_probe = lambda args: "absent"
+    try:
+        rc, data, _ = _openclaw_preflight(
+            extra_args={"corpus": "aiact",
+                        "battery": "/tmp/t-pack.json"})
+    finally:
+        rb._battery_kb_probe = saved
+    assert rc == 1
+    assert data["checks"]["battery_kb_present"] == "absent"
     assert data["all_ok"] is False
 
 

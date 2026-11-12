@@ -1341,9 +1341,18 @@ def preflight(args) -> int:
         # oc3 --battery: the live KB must be present — probe the
         # read-proxy for at least one windowless-room fact (spec R2).
         # Battery mode only; the standard path (no --battery) is
-        # unchanged.
+        # unchanged. --extraction-only EXEMPTION: the extraction run
+        # BUILDS the KB (corpus campaigns start from the deliberately
+        # empty campaign DB — Phase 1 dropped it); the probe applies
+        # only to live-KB-reuse battery runs that grade against an
+        # existing KB.
         if getattr(args, "battery", ""):
-            checks["battery_kb_present"] = _battery_kb_probe(args)
+            if getattr(args, "extraction_only", False):
+                checks["battery_kb_present"] = (
+                    "ok (--extraction-only: this run builds the KB; "
+                    "live-KB probe applies to battery reuse runs only)")
+            else:
+                checks["battery_kb_present"] = _battery_kb_probe(args)
 
         # v16: the A-gate judge must be resolvable and answering BEFORE the
         # run starts — a dead judge would burn every 75-minute case window
@@ -1383,7 +1392,10 @@ def preflight(args) -> int:
 
     ok_values = {"ok", "running", "dry-run"}
     all_ok = all(
-        v in ok_values or v.startswith("dry-run")
+        # v16.1: v.startswith("ok") accepts the ok-note exemption
+        # values (canary_fetch_ai / battery_kb_present corpus-mode and
+        # extraction-only notes) in addition to the exact "ok".
+        v in ok_values or v.startswith("ok") or v.startswith("dry-run")
         or v.startswith("172.") or v.startswith("10.") or v.startswith("192.168.")
         or (v.startswith("count=") and v != "count=0")
         for v in checks.values()
