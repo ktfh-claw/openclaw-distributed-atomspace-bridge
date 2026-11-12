@@ -1777,6 +1777,19 @@ def cleanup_das(args) -> int:
         data["canaries_before"] == data["canaries_after"]
         and all(isinstance(v, int) and v >= 1 for v in data["canaries_after"].values())
     )
+    # Corpus mode (aiact) EXEMPTION: the campaign DB starts EMPTY by
+    # design (Phase 1 dropped + recreated the das database), so the
+    # Fetch.ai canary atoms are legitimately absent (count 0). The
+    # guarantee that matters for a corpus run is INVARIANCE — cleanup
+    # must not change any live counts — not presence. Live-fire
+    # evidence: the first aiact-extract launch failed cleanup-das with
+    # canaries_intact=False on an empty, unchanged DB.
+    if _corpus(args) == CORPUS_AIACT:
+        data["canary_exemption"] = (
+            "corpus aiact: campaign DB starts empty by design — "
+            "canary count>=1 requirement waived; invariance enforced")
+        data["canaries_intact"] = (
+            data["canaries_before"] == data["canaries_after"])
     data["finished"] = _now_iso()
 
     _write_json(RESULTS_DIR / args.run_id / "cleanup-das.json", data)

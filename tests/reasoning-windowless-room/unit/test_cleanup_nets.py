@@ -489,3 +489,47 @@ def test_cleanup_das_dry_run_mentions_companion_sweep_no_calls():
     for phrase in ("compute fact handles", "discover companion links",
                    "cleanup.py each", "verify absence"):
         assert phrase in msg, phrase
+
+
+def test_cleanup_das_aiact_empty_db_canary_invariance_passes():
+    """aiact campaign regression: in --corpus aiact mode the campaign DB
+    starts EMPTY by design (Phase 1 dropped it), so canary counts are 0.
+    cleanup-das must PASS when the counts are merely INVARIANT (before ==
+    after, both 0) — the count>=1 presence requirement is waived with an
+    explicit canary_exemption record. Live-fire evidence: the first
+    aiact-extract launch failed cleanup-das on an empty, unchanged DB."""
+    mongo = FakeMongo()  # empty store — no residue, no companions
+    runner = FakeRunner(mongo)
+    captured = {}
+    out = io.StringIO()
+    with ModPatch(_mongo_eval=mongo.eval, _run=runner.run,
+                  _canary_counts=lambda: {"fetch_ai_inheritance": 0},
+                  _write_json=lambda p, d: captured.update(path=p, data=d),
+                  _container_ip=lambda c: ""):
+        with redirect_stdout(out):
+            rc = rb.cleanup_das(SimpleNamespace(run_id="unit-cleanup-aiact",
+                                               dry_run=False,
+                                               corpus="aiact"))
+    assert rc == 0, out.getvalue()
+    data = captured["data"]
+    assert data["canaries_intact"] is True
+    assert data["canaries_before"] == data["canaries_after"]
+    assert "starts empty by design" in data["canary_exemption"]
+
+
+def test_cleanup_das_aiact_canary_change_still_fails():
+    """The corpus-mode waiver enforces INVARIANCE: a canary count that
+    CHANGES during cleanup still fails the corpus run."""
+    mongo = FakeMongo()
+    runner = FakeRunner(mongo)
+    counts = iter([{"fetch_ai_inheritance": 0}, {"fetch_ai_inheritance": 3}])
+    out = io.StringIO()
+    with ModPatch(_mongo_eval=mongo.eval, _run=runner.run,
+                  _canary_counts=lambda: next(counts),
+                  _container_ip=lambda c: ""):
+        with redirect_stdout(out):
+            rc = rb.cleanup_das(SimpleNamespace(run_id="unit-cleanup-aiact2",
+                                               dry_run=False,
+                                               corpus="aiact"))
+    assert rc == 1
+    assert "canary counts changed" in out.getvalue()
