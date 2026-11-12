@@ -1,0 +1,71 @@
+{
+  "schema": "question-pack/1",
+  "name": "EU AI Act Articles 1-15 (artificialintelligenceact.eu corpus, branch ai-act-extraction-campaign)",
+  "cases": [
+    {
+      "id": "ai-system-definition",
+      "question": "According to Article 3(1) of the AI Act, what is an 'AI system'? Give the definition.",
+      "expected_answer": "A machine-based system that is designed to operate with varying levels of autonomy and that may exhibit adaptiveness after deployment, and that, for explicit or implicit objectives, infers from the input it receives how to generate outputs such as predictions, content, recommendations, or decisions that can influence physical or virtual environments."
+    },
+    {
+      "id": "regulation-purpose",
+      "question": "What is the purpose of the AI Act according to Article 1(1)?",
+      "expected_answer": "To improve the functioning of the internal market and promote the uptake of human-centric and trustworthy artificial intelligence, while ensuring a high level of protection of health, safety and fundamental rights (including democracy, the rule of law and environmental protection) and guarding against the harmful effects of AI systems."
+    },
+    {
+      "id": "military-exclusion-false",
+      "question": "True or false: the AI Act applies to AI systems that are placed on the market, put into service, or used exclusively for military, defence or national security purposes, regardless of the type of entity carrying out those activities.",
+      "expected_answer": "False. Article 2(3) states the Regulation does not apply to such systems, regardless of the type of entity carrying out those activities."
+    },
+    {
+      "id": "ai-literacy-measures",
+      "question": "What obligation does Article 4 impose on providers and deployers of AI systems regarding AI literacy?",
+      "expected_answer": "They must take measures to ensure, to their best extent, a sufficient level of AI literacy of their staff and other persons dealing with the operation and use of AI systems on their behalf. AI literacy means skills, knowledge and understanding that allow providers, deployers and affected persons to make an informed deployment and use of AI systems as well as to gain awareness about the opportunities and risks and possible harm."
+    },
+    {
+      "id": "social-scoring-prohibition",
+      "question": "Article 5(c) prohibits certain social scoring AI practices. Under which two conditions on the resulting treatment does the prohibition bite?",
+      "expected_answer": "The social score must lead to either or both of: (i) detrimental or unfavourable treatment of certain natural persons or groups in social contexts unrelated to the contexts in which the data was originally generated or collected; or (ii) detrimental or unfavourable treatment that is unjustified or disproportionate to their social behaviour or its gravity."
+    },
+    {
+      "id": "emotion-recognition-exception",
+      "question": "Where does Article 5(f) prohibit the use of AI systems that infer emotions of a natural person, and what is the exception?",
+      "expected_answer": "The use is prohibited in the areas of workplace and education institutions, except where the use is intended to be put in place or into the market for medical or safety reasons."
+    },
+    {
+      "id": "high-risk-safety-component",
+      "question": "Under Article 6(1), when is an AI system considered high-risk by virtue of being a product safety component or a product itself under Union harmonisation legislation?",
+      "expected_answer": "Where both of the following conditions are fulfilled: (a) the AI system is intended to be used as a safety component of a product (or is itself a product) covered by the Union harmonisation legislation listed in Annex I; and (b) the product in question is required to undergo a third-party conformity assessment under that Annex I legislation."
+    },
+    {
+      "id": "annex-iii-derogation",
+      "question": "An AI system falls under Annex III but the provider believes it is not high-risk. Under Article 6(3) and 6(4), when is an Annex III system NOT considered high-risk, what is the profiling carve-out, and what must a provider who deems its Annex III system not high-risk do?",
+      "expected_answer": "Article 6(3): an Annex III system is not high-risk where it does not pose a significant risk of harm to health, safety or fundamental rights of natural persons, including by not materially influencing the outcome of decision making; this applies where it performs a narrow procedural task, improves the result of a previously completed human activity, detects decision-making patterns or deviations without replacing or influencing the prior human assessment without proper review, or performs a preparatory task to an Annex III assessment. However, a system that performs profiling of natural persons is always high-risk. Article 6(4): a provider who considers an Annex III system not high-risk must document its assessment before placing on the market or putting into service, is subject to the Article 49(2) registration obligation, and must provide the documentation to national competent authorities upon request."
+    },
+    {
+      "id": "risk-management-lifecycle",
+      "question": "How does Article 9 characterize the risk management system a provider of a high-risk AI system must establish, and over what span must it run?",
+      "expected_answer": "It is a continuous iterative process planned and run throughout the entire lifecycle of the high-risk AI system, requiring identification and analysis of known and foreseeable risks, estimation and evaluation of risks, and adoption of appropriate risk management measures."
+    },
+    {
+      "id": "bias-examination",
+      "question": "What does Article 10(2)(f) require regarding biases in training, validation and testing data sets?",
+      "expected_answer": "In order to detect and prevent possible biases that are likely to affect the health and safety of persons, have a negative impact on fundamental rights, or discriminate against natural persons or groups, the data sets must be examined in view of possible biases, and appropriate measures must be taken to detect, prevent and mitigate possible biases."
+    },
+    {
+      "id": "human-oversight-measures",
+      "question": "Which human oversight capabilities must high-risk AI systems enable under Article 14(4)?",
+      "expected_answer": "The measures must enable the assigned overseers to duly monitor the system's functioning, to remain aware of possible automation bias, to correctly interpret the output, to decide not to use the system or to otherwise disregard, override or reverse its output, and to interrupt the system through a 'stop' button or a similar procedure that allows the system to come to a halt in a safe state."
+    },
+    {
+      "id": "transparency-instructions",
+      "question": "What transparency obligation does Article 13 place on providers of high-risk AI systems toward deployers, and how does it relate to interpreting outputs?",
+      "expected_answer": "High-risk AI systems must be designed so that natural persons can be aware of and understand their outputs, and the systems must be accompanied by instructions for use; the instructions include (among other content) information to enable deployers to interpret the output of the high-risk AI system and use it appropriately."
+    },
+    {
+      "id": "penalties-unsolvable",
+      "question": "Article 99 of the AI Act provides for fines for supplying incorrect, incomplete or misleading information to notified bodies. What administrative fine does Article 99 impose for that conduct?",
+      "source_expectations": []
+    }
+  ]
+}
