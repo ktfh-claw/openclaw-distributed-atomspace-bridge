@@ -1883,23 +1883,46 @@ def _render_extraction_prompt(args, case: dict) -> str:
     paragraph extraction pipeline; the {{ALL_QUESTIONS}} extraction
     context comes from the battery pack (external pack when
     --battery <path> is bound, the built-in BATTERY_CASES for the
-    built-in id) — the standard mode is byte-identical to before."""
+    built-in id) — the standard mode is byte-identical to before.
+
+    aiact PER-ARTICLE mode (campaign tick 5/6 — the whole-corpus
+    single turn overflowed the SUT session window): when the
+    orchestrator has bound ONE article (args.article_file /
+    args.article_url), the per-article template
+    (agent_extraction_prompt_template_aiact_article.md) renders with
+    {{ARTICLE_FILE}}/{{ARTICLE_URL}}/{{ARTICLE_STEM}} — one article,
+    one fresh session, same facts-index carry-over, per-article
+    ARTICLE-COMPLETE manifest line as the turn boundary."""
     facts_mod = _facts_mod()
+    profile = _profile(args)
     if _corpus(args) == CORPUS_AIACT:
-        template_name = "agent_extraction_prompt_template_aiact.md"
-        battery = getattr(args, "battery", "")
-        context_cases = (_pack_cases(battery)
-                         if battery and battery != BATTERY_PACK_ID
-                         else facts_mod.BATTERY_CASES)
+        article_file = getattr(args, "article_file", "")
+        context_cases = (_pack_cases(getattr(args, "battery", ""))
+                         or facts_mod.BATTERY_CASES)
         all_questions = "\n".join(f"- {c['question']}" for c in context_cases)
         if not all_questions:
             all_questions = ("- (no question pack bound — extract the full "
                              "corpus faithfully, paragraph by paragraph)")
+        if article_file:
+            template = (HERE
+                        / "agent_extraction_prompt_template_aiact_article.md"
+                        ).read_text(encoding="utf-8")
+            return _apply_profile_prompt_paths((template
+                    .replace("{{RUN_ID}}", args.run_id)
+                    .replace("{{ALL_QUESTIONS}}", all_questions)
+                    .replace("{{URL_LIST_PATH}}", profile.urls_prompt_rel)
+                    .replace("{{ANSWERS_PATH}}", profile.answers_prompt_rel)
+                    .replace("{{FACTS_INDEX_PATH}}", profile.facts_index_prompt_rel)
+                    .replace("{{ARTICLE_FILE}}", article_file)
+                    .replace("{{ARTICLE_URL}}",
+                              getattr(args, "article_url", ""))
+                    .replace("{{ARTICLE_STEM}}", article_file[:-3])),
+                    profile)
+        template_name = "agent_extraction_prompt_template_aiact.md"
     else:
         template_name = "agent_extraction_prompt_template.md"
         all_questions = "\n".join(f"- {c['question']}"
                                   for c in facts_mod.TEST_CASES)
-    profile = _profile(args)
     template = (HERE / template_name).read_text(encoding="utf-8")
     return _apply_profile_prompt_paths((template
             .replace("{{RUN_ID}}", args.run_id)
@@ -1993,8 +2016,18 @@ def _delivery_session_key(case_id: str, phase: str | None = None) -> str:
     extraction turn targets ``extract`` (no case — the shared KB
     extraction); each per-case reasoning turn targets ``case-<case_id>``
     — distinct sessions, so gateway restart-recovery cannot re-dispatch
-    a stale phase's zombie into the live phase's session."""
+    a stale phase's zombie into the live phase's session.
+
+    aiact per-article extraction (campaign tick 5/6): the per-ARTICLE
+    extraction turns pass their own pseudo-case id (``extract-a01`` ..
+    ``extract-a15``) — each article gets a FRESH session (one article's
+    context fits the SUT session window; the whole-corpus single turn
+    overflowed it). Any other extraction case id keeps the run-level
+    ``extract`` key (oc2 C6 behavior unchanged)."""
     if phase == "extraction":
+        if (case_id.startswith("extract-a")
+                and case_id != EXTRACT_PSEUDO_CASE):
+            return case_id
         return "extract"
     return f"case-{case_id}"
 
@@ -2204,8 +2237,15 @@ def setup_case(args, phase: str = None) -> int:
         return 0
 
     if phase == "extraction":
-        # oc2 C3: the run-level extraction is ALWAYS the run start
-        first = True
+        # oc2 C3: the run-level extraction is ALWAYS the run start.
+        # aiact per-article mode (campaign tick 5/6): NEVER first here —
+        # the article orchestrator (_run_article_extractions) performs
+        # the ONE run-start init (answers/facts-index + stale-manifest
+        # sweep) BEFORE the first article, so a later article's setup
+        # can never re-init the answers/facts-index (wiping the
+        # cross-article carry-over) and can never sweep the manifest
+        # that accumulates the per-article ARTICLE-COMPLETE lines.
+        first = not _per_article_extraction(args)
     else:
         first = args.case == facts_mod.TEST_CASES[0]["id"]
     _prepare_benchmark_dir(args)
@@ -2291,7 +2331,7 @@ def setup_case(args, phase: str = None) -> int:
               f"(case {args.case}; prior content archived in {snap.name})")
 
     stale_manifests: list[str] = []
-    if phase == "extraction":
+    if phase == "extraction" and first:
         # v2 phase-1 hygiene: a stale manifest from a previous/aborted run
         # would satisfy the extraction prompt's STOP rule on the first wake
         # cycle ("manifest already written -> do NOTHING") and the phase-1
@@ -2396,6 +2436,22 @@ CHECKPOINT_DIR_REL = "knowledge-checkpoints"
 # windows/extract/phase1-docker.log). Not a real TEST_CASES id.
 EXTRACT_PSEUDO_CASE = "extract"
 MANIFEST_POLL_INTERVAL_S = 30.0
+# aiact per-article extraction (campaign tick 5/6): the manifest file
+# the per-article template appends to (one manifest for the whole
+# corpus, one ARTICLE-COMPLETE line per article — the per-article turn
+# boundary the harness polls) and the greppable line prefix.
+AIACT_MANIFEST_NAME = "aiact-extraction.md"
+AIACT_ARTICLE_COMPLETE_PREFIX = "ARTICLE-COMPLETE:"
+
+
+def _per_article_extraction(args) -> bool:
+    """True when this extraction setup/render is ONE article of the
+    aiact corpus (the per-ARTICLE delivery-turn mode). The article
+    orchestrator (_run_article_extractions) binds args.article_file /
+    args.article_url / args.article_index before each per-article
+    setup; every consumer must tolerate the attributes being absent
+    (standard runs and the whole-corpus aiact render never set them)."""
+    return bool(getattr(args, "article_file", ""))
 
 PHASE1_LOG_BASENAME = "phase1-docker.log"
 
@@ -2568,6 +2624,99 @@ def _poll_checkpoint_manifest(args, since_iso: str,
               f"{since_iso} after {elapsed}s — grading the case as-is "
               "(no boundary invented)")
     return {"found": False, "manifests": [], "elapsed_s": elapsed,
+            "timeout_s": timeout_s, "poll_interval_s": interval_s,
+            "since_iso": since_iso, "stall_aborted": stall_aborted}
+
+
+def _poll_article_checkpoint(args, article_stem: str, since_iso: str,
+                             timeout_s: float | None = None,
+                             interval_s: float = MANIFEST_POLL_INTERVAL_S,
+                             _sleep=time.sleep,
+                             stall_minutes: float = 0.0) -> dict:
+    """aiact per-article turn boundary poll (campaign tick 5/6): poll
+    the corpus manifest (knowledge-checkpoints/aiact-extraction.md)
+    for THIS article's ARTICLE-COMPLETE line — the per-article template
+    appends it after the article's last receipt is recorded. Content
+    predicate (not the mtime census of _poll_checkpoint_manifest): the
+    manifest accumulates across articles and may be touched mid-article
+    (earlier articles' lines exist at turn start), so only the exact
+    line for THIS article is the boundary.
+
+    The stall watchdog and delivery re-issue semantics mirror
+    _poll_checkpoint_manifest: forward signal = facts-index content
+    change or a fresh persist receipt; a stall re-issues the delivery
+    turn (rate-limited by the stall window) and keeps polling until the
+    phase timeout; timeout/stall without the line returns found=False
+    (the orchestrator records the article as incomplete and moves on —
+    the next article's restart kills any zombie turn).
+
+    Returns {"found": bool, "line": str, "elapsed_s": int,
+    "timeout_s": float, "poll_interval_s": float, "since_iso": str,
+    "stall_aborted": bool}."""
+    if timeout_s is None:
+        timeout_s = float(getattr(args, "timeout_minutes", 75) * 60)
+    if timeout_s <= 0:
+        timeout_s = 1.0
+    stall_s = float(stall_minutes or 0) * 60
+    profile = _profile(args)
+    # the per-article pseudo-case IS the session key (extract-aNN)
+    session_key = _delivery_session_key(args.case, "extraction")
+    manifest = _checkpoint_dir(args) / AIACT_MANIFEST_NAME
+    paths = _bench_paths(args)
+    facts_state = _sudo_read(paths["facts_index"]) or ""
+    start = time.time()
+    last_signal = time.time()
+    stall_aborted = False
+    found_line = ""
+    while time.time() - start < timeout_s:
+        if profile.delivers_agent_turn:
+            delivery_rc = _delivery_exit(args, session_key)
+            if delivery_rc is not None and delivery_rc != 0:
+                _maybe_reissue_delivery(
+                    args, session_key, stall_s,
+                    f"delivery turn exited {delivery_rc}")
+        content = _sudo_read(manifest) or ""
+        for ln in content.splitlines():
+            s = ln.strip()
+            if (s.startswith(AIACT_ARTICLE_COMPLETE_PREFIX)
+                    and article_stem in s):
+                found_line = s
+                break
+        if found_line:
+            elapsed = int(time.time() - start)
+            print(f"[wait-article] boundary reached: {found_line} "
+                  f"after {elapsed}s")
+            return {"found": True, "line": found_line,
+                    "elapsed_s": elapsed, "timeout_s": timeout_s,
+                    "poll_interval_s": interval_s, "since_iso": since_iso,
+                    "stall_aborted": False}
+        if stall_s > 0:
+            facts_now = _sudo_read(paths["facts_index"]) or ""
+            if facts_now != facts_state:
+                facts_state = facts_now
+                last_signal = time.time()
+            elif _recent_persist_signal(
+                    profile, max(120.0, interval_s * 4),
+                    _memory_volume(args)):
+                last_signal = time.time()
+            if time.time() - last_signal >= stall_s:
+                if _maybe_reissue_delivery(args, session_key, stall_s,
+                                           "article extraction stall"):
+                    last_signal = time.time()
+                else:
+                    stall_aborted = True
+                    break
+        _sleep(interval_s)
+    elapsed = int(time.time() - start)
+    if stall_aborted:
+        print(f"[wait-article] STALL: no forward signal for "
+              f"{stall_minutes}m after {elapsed}s — article "
+              f"{article_stem} recorded incomplete (no boundary invented)")
+    else:
+        print(f"[wait-article] TIMEOUT: no ARTICLE-COMPLETE line for "
+              f"{article_stem} since {since_iso} after {elapsed}s — "
+              "article recorded incomplete (no boundary invented)")
+    return {"found": False, "line": "", "elapsed_s": elapsed,
             "timeout_s": timeout_s, "poll_interval_s": interval_s,
             "since_iso": since_iso, "stall_aborted": stall_aborted}
 
@@ -3316,6 +3465,128 @@ def _copy_window_artifacts(args, case_id: str) -> None:
             _sudo_run(["cp", str(src), str(rd / f"pre-{phase}.metta")])
 
 
+def _run_article_extractions(args) -> tuple[dict, bool]:
+    """aiact per-article extraction orchestrator (campaign tick 5/6 —
+    the single whole-corpus turn pulled ~190k tokens of article text
+    plus a ~109k-token prompt into ONE SUT session window: guaranteed
+    context-overflow cascade + degenerate output; live-fire evidence
+    2026-11-12 01:19 UTC). ONE delivery turn PER ARTICLE (fresh
+    session wr-<run_id>-extract-aNN, prompt scoped to that article,
+    ~25k tokens max context), reusing the frozen per-case machinery:
+    history trim, facts-index carry-over + dedup, delivery re-issue,
+    per-article ARTICLE-COMPLETE manifest lines as turn boundaries.
+
+    Flow per article: bind args.article_* -> setup_extraction_phase
+    (backup once, trim, render the per-article prompt, restart, start
+    the turn) -> _poll_article_checkpoint (stall watchdog + phase
+    timeout) -> phase-1 log snapshot (the next article's restart kills
+    the container) -> persist-receipt census -> record. An article that
+    times out or stalls out is RECORDED incomplete and the loop moves
+    on (the next restart kills any zombie turn); only a setup failure
+    aborts the loop as a harness error.
+
+    Run-start work done HERE, once, before the first article (setup_case
+    is never `first` in per-article mode): fresh answers.md +
+    facts-index.md, and the stale-manifest sweep (a dead run's manifest
+    must not pollute the per-article boundary namespace; the manifest
+    then ACCUMULATES the 15 ARTICLE-COMPLETE lines across the run).
+
+    --articles (comma list of file names or stems) limits the loop — a
+    smoke-test/repair subset. cleanup-das at launch sweeps the DAS KB,
+    so a re-run redoes its articles from scratch.
+
+    Returns (shared_extraction_summary, harness_error)."""
+    urls = _corpus_source_urls(args) or {}
+    articles = sorted(f for f in urls if f.startswith("article-"))
+    sel = getattr(args, "articles", "")
+    if sel:
+        wanted = {s.strip() for s in sel.split(",") if s.strip()}
+        articles = [a for a in articles
+                    if a in wanted or a[:-3] in wanted]
+    print(f"[full] per-article extraction: {len(articles)} article(s): "
+          f"{', '.join(a[:-3] for a in articles)}")
+    paths = _bench_paths(args)
+    # ONE run-start init (per-article setups are never `first`)
+    _sudo_write(paths["answers"],
+                f"# Benchmark answers — {args.run_id} (sequential standalone questions)\n")
+    _sudo_write(paths["facts_index"],
+                f"# Extraction record — {args.run_id}\n"
+                "# One persisted predicate expression per line (append after each add-atom).\n")
+    sweep: list[str] = []
+    try:
+        sweep = _sweep_stale_manifests(args)
+    except RuntimeError as e:
+        print(f"[full] ERROR: stale-manifest sweep failed: {e}")
+        return {"per_article": True, "articles": {},
+                "articles_completed": 0, "articles_total": len(articles),
+                "stale_manifests_archived": [], "sweep_error": str(e)}, True
+    results: dict[str, dict] = {}
+    harness_error = False
+    for fname in articles:
+        stem = fname[:-3]
+        pseudo = f"extract-a{stem.split('-')[-1]}"
+        args.case = pseudo
+        args.article_file = fname
+        args.article_url = urls[fname]
+        facts_before = _sudo_read(paths["facts_index"]) or ""
+        print(f"\n[full] === ARTICLE {stem} (EXTRACTION turn) ===")
+        rc = setup_extraction_phase(args)
+        if rc != 0:
+            results[stem] = {"verdict": "ERROR", "phase": "setup"}
+            harness_error = True
+            break
+        setup_json = (_load_json(
+            RESULTS_DIR / args.run_id
+            / f"setup-extraction-case-{pseudo}.json") or {})
+        since_iso = setup_json.get("restarted_at") or _now_iso()
+        phase_timeout_s = float(
+            getattr(args, "phase_timeout_minutes", 0) or 0) * 60 or None
+        poll = _poll_article_checkpoint(
+            args, stem, since_iso, timeout_s=phase_timeout_s,
+            stall_minutes=float(getattr(args, "stall_minutes", 0) or 0))
+        _write_json(RESULTS_DIR / args.run_id
+                    / f"wait-article-{pseudo}.json", poll)
+        snap = _snapshot_phase1_logs(args, since_iso)
+        _copy_window_artifacts(args, pseudo)
+        receipts = _census_persist_receipts(
+            since_iso, _now_iso(),
+            profile=_profile(args), memory_volume=_memory_volume(args))
+        facts_after = _sudo_read(paths["facts_index"]) or ""
+        results[stem] = {
+            "manifest_found": poll["found"],
+            "boundary_line": poll.get("line", ""),
+            "elapsed_s": poll.get("elapsed_s"),
+            "stall_aborted": poll.get("stall_aborted", False),
+            "persist_receipts": receipts.get("count", 0),
+            "facts_index_lines_before": facts_before.count("\n"),
+            "facts_index_lines_after": facts_after.count("\n"),
+            "phase1_snapshot": snap.get("path"),
+            "restarted_at": since_iso,
+        }
+        print(f"[full] article {stem}: "
+              + ("COMPLETE" if poll["found"] else "INCOMPLETE")
+              + f" — receipts={receipts.get('count', 0)}, "
+              f"facts-index {facts_before.count(chr(10))}→"
+              f"{facts_after.count(chr(10))} lines, "
+              f"elapsed={poll.get('elapsed_s')}s")
+    # restore the shared-extraction namespace (per-case reasoning —
+    # unused under --extraction-only, but teardown/report read args.case)
+    args.case = EXTRACT_PSEUDO_CASE
+    args.article_file = ""
+    args.article_url = ""
+    completed = sum(1 for r in results.values() if r.get("manifest_found"))
+    return {
+        "per_article": True,
+        "articles": results,
+        "articles_completed": completed,
+        "articles_total": len(articles),
+        "stale_manifests_archived": sweep,
+        "manifest_found": (completed == len(articles) and bool(articles)),
+        "persist_receipts": sum(r.get("persist_receipts", 0)
+                                 for r in results.values()),
+    }, harness_error
+
+
 def full_shared_kb(args) -> int:
     """oc2 C3 (shared one-time KB extraction, owner directive
     2026-11-04): preflight -> cleanup-das -> ONE run-level EXTRACTION
@@ -3379,7 +3650,14 @@ def full_shared_kb(args) -> int:
             break
 
     shared_extraction: dict = {}
-    if not harness_error:
+    if not harness_error and extraction_only and _corpus(args) == CORPUS_AIACT:
+        # --- aiact campaign (tick 5/6): PER-ARTICLE extraction turns ---
+        # the single whole-corpus turn overflowed the SUT session window
+        # (live-fire evidence 2026-11-12 01:19 UTC); one turn per article
+        # reuses the frozen per-case machinery (trim, carry-over, re-issue,
+        # manifest boundaries) — see _run_article_extractions.
+        shared_extraction, harness_error = _run_article_extractions(args)
+    elif not harness_error:
         # --- ONE run-level EXTRACTION phase (shared prompt + restart) ---
         print("\n[full] === SHARED EXTRACTION (run-level, once per run) ===")
         args.case = EXTRACT_PSEUDO_CASE
@@ -3471,6 +3749,17 @@ def full_shared_kb(args) -> int:
     cases_passed = sum(1 for v in per_case.values() if v.get("verdict") == "PASS")
     adherence_clean = sum(1 for v in per_case.values()
                           if not v.get("adherence_conditions"))
+    # aiact per-article extraction (tick 5/6): the gate verdict counts
+    # ARTICLE completion — an article that timed out or stalled out is
+    # recorded incomplete and FAILS the extraction-only gate (the KB is
+    # knowingly partial; the summary carries the per-article detail)
+    extraction_ok = True
+    if extraction_only and shared_extraction.get("per_article"):
+        total = shared_extraction.get("articles_total", 0)
+        completed = shared_extraction.get("articles_completed", 0)
+        extraction_ok = total > 0 and completed == total
+        if not extraction_ok:
+            gate_exit = GATE_FAIL
     summary = {
         "run_id": args.run_id,
         "mode": ("extraction-only" if extraction_only
@@ -3478,7 +3767,8 @@ def full_shared_kb(args) -> int:
         "corpus": (_corpus(args) or "standard"),
         "gate_verdict": ("PASS" if ((cases_passed == len(case_ids)
                                      or extraction_only)
-                                    and not harness_error) else "FAIL"),
+                                    and not harness_error
+                                    and extraction_ok) else "FAIL"),
         "cases_passed": cases_passed,
         "cases_total": len(case_ids),
         "adherence_clean_cases": adherence_clean,
@@ -4155,6 +4445,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "the ONE run-level shared EXTRACTION phase and skip "
                          "the per-case reasoning phases (the KB is built "
                          "here; a later --battery run grades it)")
+    fp.add_argument("--articles", default="", metavar="A,B,...",
+                    help="aiact per-article extraction (campaign tick 5/6): "
+                         "comma-separated article file names or stems "
+                         "(e.g. article-01 or article-01,article-05) — "
+                         "limits the per-article loop to a smoke-test or "
+                         "repair subset (cleanup-das at launch sweeps the "
+                         "KB, so a re-run redoes its articles from "
+                         "scratch)")
     fp.add_argument("--skip-report", action="store_true")
     fp.add_argument("--allow-dirty-backup", action="store_true")
     fp.add_argument("--keep-snapshots", action="store_true")
